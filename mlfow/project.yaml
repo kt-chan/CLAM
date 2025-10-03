@@ -1,0 +1,15 @@
+name: CLAM_MHIST_Finetune
+
+parameters:
+  data_root_dir: {type: path, default: /path/to/MHIST_FEATURES}
+  task_name: {type: string, default: mhist_subtyping}
+  exp_code: {type: string, default: MHIST_CLAM_FINETUNE}
+  fold: {type: int, default: 0}
+  lr: {type: float, default: 2e-4}
+  model_type: {type: string, default: clam_sb}
+  embed_dim: {type: int, default: 1024}
+
+entry_points:
+  main:
+    parameters: [data_root_dir, task_name, exp_code, fold, lr, model_type, embed_dim]
+    command: "python run_clam.py --data_root_dir {data_root_dir} --task {task_name} --exp_code {exp_code} --k 10 --seed 1 --fold {fold} --lr {lr} --model_type {model_type} --embed_dim {embed_dim}"

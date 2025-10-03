@@ -1,0 +1,55 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "2. Feature Extraction",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "extract_features_fp.py",
+            "console": "integratedTerminal",
+            "python": "${command:python.interpreterPath}",
+            // --- Environment Variable for GPU ---
+            // Sets CUDA_VISIBLE_DEVICES to 0 for this run
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            // --- Script Arguments ---
+            "args": [
+                // Directory containing patch coordinates (.h5 files from the patching step)
+                "--data_h5_dir",
+                "./data/outputs/TCGA",
+                // Directory containing the original WSI files (.svs)
+                "--data_slide_dir",
+                "./data/inputs/TCGA",
+                // Directory where the final feature vectors (.pt files) will be saved
+                "--feat_dir",
+                "./data/features/TCGA",
+                // Model encoder to use (e.g., resnet50_trunc, uni, conch)
+                "--model_name",
+                "resnet50_trunc",
+                "--batch_size",
+                "512",
+                "--csv_path",
+                "./data/outputs/TCGA/process_list_autogen.csv"
+            ]
+        },
+        {
+            "name": "1. Segmentation and Patching",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "create_patches_fp.py",
+            "args": [
+                "--source",
+                "./data/inputs/TCGA",
+                "--save_dir",
+                "./data/outputs/TCGA",
+                "--patch_size",
+                "256",
+                "--seg",
+                "--patch",
+                "--stitch"
+            ],
+            "console": "integratedTerminal"
+        }
+    ]
+}

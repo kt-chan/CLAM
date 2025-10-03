@@ -1,0 +1,30 @@
+name: clam_mhist
+channels:
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch
+  - torchvision
+  - cudatoolkit=12.8 # Adjust based on your GPU/CUDA version
+  - pip
+  - pip:
+    - mlflow==3.4.0 # Or latest 3.x release
+    - timm==0.9.8
+    - torch
+    - torchvision
+    - h5py
+    - pandas
+    - PyYAML
+    - opencv-python
+    - matplotlib
+    - scikit-learn
+    - numpy  
+    - scipy
+    - tqdm
+    - openslide-python
+    - git+https://github.com/oval-group/smooth-topk.git
+    - tensorboardX
+    - openslide-bin
+    - openslide-python
+    - h5py
