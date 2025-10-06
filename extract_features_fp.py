@@ -21,7 +21,8 @@ from pathlib import Path
 
 
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-num_cpus = os.cpu_count() or 1
+num_cpus = 12
+# num_cpus = ( os.cpu_count() -2 )or 1
 
 
 def compute_w_loader(output_path, loader, model, verbose=0):
@@ -96,7 +97,7 @@ if __name__ == "__main__":
     total = len(bags_dataset)
 
     loader_kwargs = (
-        {"num_workers": 8, "pin_memory": True} if device.type == "cuda" else {}
+        {"num_workers": num_cpus, "pin_memory": True} if device.type == "cuda" else {}
     )
 
     for bag_candidate_idx in tqdm(range(total)):
