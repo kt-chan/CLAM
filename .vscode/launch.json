@@ -2,6 +2,40 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "4. Model Evaluation",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "eval.py",
+            "console": "integratedTerminal",
+            "python": "${command:python.interpreterPath}",
+            // --- Environment Variable for GPU ---
+            // Sets CUDA_VISIBLE_DEVICES to 0 for this run
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            // --- Script Arguments ---
+            "args": [
+                "--k",
+                "1",
+                "--models_exp_code",
+                "task_1_tumor_vs_normal_resnet50_s1",
+                "--save_exp_code",
+                "task_1_tumor_vs_normal_resnet50_s1_cv",
+                "--task",
+                "task_1_tumor_vs_normal",
+                "--model_type",
+                "clam_sb",
+                "--results_dir",
+                "results",
+                "--data_root_dir",
+                "./data/features/",
+                "--data_set_name",
+                "TCGA",
+                "--embed_dim",
+                "1024"
+            ]
+        },
+        {
             "name": "3. Model Training",
             "type": "debugpy",
             "request": "launch",
