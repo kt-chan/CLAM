@@ -21,7 +21,7 @@ from pathlib import Path
 
 
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-num_cpus = 12
+num_cpus = 8
 # num_cpus = ( os.cpu_count() -2 )or 1
 
 
@@ -107,7 +107,7 @@ if __name__ == "__main__":
         h5_file_path = str(Path(h5_file_path))
         slide_file_path = os.path.join(args.data_slide_dir, slide_id + args.slide_ext)
         slide_file_path = str(Path(slide_file_path))
-        print("\nprogress: {}/{}".format(bag_candidate_idx, total))
+        print("\nprogress: {}/{}".format(bag_candidate_idx + 1, total))
         print(slide_id)
 
         if not args.no_auto_skip and slide_id + ".pt" in dest_files:

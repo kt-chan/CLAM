@@ -2,6 +2,49 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "3. Model Training",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "integratedTerminal",
+            "python": "${command:python.interpreterPath}",
+            // --- Environment Variable for GPU ---
+            // Sets CUDA_VISIBLE_DEVICES to 0 for this run
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            },
+            // --- Script Arguments ---
+            "args": [
+                "--max_epochs",
+                "10",
+                "--drop_out",
+                "0.25",
+                "--early_stopping",
+                "--lr",
+                "2e-4",
+                "--k",
+                "1",
+                "--exp_code",
+                "task_1_tumor_vs_normal_resnet50",
+                "--weighted_sample",
+                "--bag_loss",
+                "ce",
+                "--inst_loss",
+                "svm",
+                "--task",
+                "task_1_tumor_vs_normal",
+                "--model_type",
+                "clam_sb",
+                "--log_data",
+                "--data_root_dir",
+                "./data/features/",
+                "--data_set_name",
+                "TCGA",
+                "--embed_dim",
+                "1024"
+            ]
+        },
+        {
             "name": "2. Feature Extraction",
             "type": "debugpy",
             "request": "launch",
@@ -34,7 +77,7 @@
             ]
         },
         {
-            "name": "1. Segmentation and Patching",
+            "name": "1. Segmentation & Patching",
             "type": "debugpy",
             "request": "launch",
             "program": "create_patches_fp.py",
