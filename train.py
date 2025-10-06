@@ -1,3 +1,5 @@
+## train.py (MLflow Integrated)
+
 from __future__ import print_function
 
 import argparse
@@ -23,6 +25,11 @@ import torch.nn.functional as F
 
 import pandas as pd
 import numpy as np
+import mlflow # <-- ADDED MLflow import
+
+# Check if the required utility functions exist (placeholder for completeness)
+# NOTE: It's assumed that `get_optim`, `print_network`, `calculate_error`,
+# `get_split_loader`, and `save_pkl` are defined in the imported utilities.
 
 
 class MILTrainingConfig:
@@ -199,76 +206,113 @@ def setup_dataset(config):
 
 
 def run_training(config):
-    """Main training function"""
-    # Setup device and seed
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    seed_torch(config.seed)
+    """
+    Main training function. 
+    Starts the main MLflow run and coordinates cross-validation.
+    """
     
-    # Setup dataset
-    dataset = setup_dataset(config)
+    # ====================================================================
+    # MLFLOW INTEGRATION: Start the main run for cross-validation
+    # The per-fold runs are nested within this one (handled in core_utils.train).
+    # ====================================================================
+    # Set the MLflow experiment name
+    experiment_name = f"Triain_{config.exp_code}"
+    mlflow.set_experiment(experiment_name)
     
-    # Verify split directory exists
-    assert os.path.isdir(config.split_dir), f"Split directory {config.split_dir} does not exist"
-    
-    # Log settings
-    settings = config.get_settings()
-    log_file = os.path.join(config.results_dir, "experiment_{}.txt".format(config.exp_code))
-    with open(log_file, "w") as f:
-        print(settings, file=f)
-    
-    print("################# Settings ###################")
-    for key, val in settings.items():
-        print("{}:  {}".format(key, val))
-    
-    # Run training across folds
-    all_test_auc = []
-    all_val_auc = []
-    all_test_acc = []
-    all_val_acc = []
-    
-    folds = np.arange(config.start_fold, config.end_fold)
-    for i in folds:
+    run_name = f"CV_Seed{config.seed}_k{config.k}"
+    with mlflow.start_run(run_name=run_name) as run:
+        
+        # Setup device and seed
+        # NOTE: seed_torch is defined at the end of this file
         seed_torch(config.seed)
-        train_dataset, val_dataset, test_dataset = dataset.return_splits(
-            from_id=False, 
-            csv_path=os.path.join(config.split_dir, "splits_{}.csv".format(i))
-        )
+        
+        # Setup dataset
+        dataset = setup_dataset(config)
+        
+        # Verify split directory exists
+        assert os.path.isdir(config.split_dir), f"Split directory {config.split_dir} does not exist"
+        
+        # Log settings
+        settings = config.get_settings()
+        
+        # ====================================================================
+        # MLFLOW INTEGRATION: Log all parameters
+        # ====================================================================
+        mlflow.log_params(settings)
+        
+        log_file = os.path.join(config.results_dir, "experiment_{}.txt".format(config.exp_code))
+        with open(log_file, "w") as f:
+            print(settings, file=f)
+        
+        print("################# Settings ###################")
+        for key, val in settings.items():
+            print("{}:  {}".format(key, val))
+        
+        # Run training across folds
+        all_test_auc = []
+        all_val_auc = []
+        all_test_acc = []
+        all_val_acc = []
+        
+        folds = np.arange(config.start_fold, config.end_fold)
+        for i in folds:
+            seed_torch(config.seed)
+            train_dataset, val_dataset, test_dataset = dataset.return_splits(
+                from_id=False, 
+                csv_path=os.path.join(config.split_dir, "splits_{}.csv".format(i))
+            )
 
-        datasets = (train_dataset, val_dataset, test_dataset)
-        results, test_auc, val_auc, test_acc, val_acc = train(datasets, i, config)
+            datasets = (train_dataset, val_dataset, test_dataset)
+            # NOTE: train is the core_utils.train function which now handles nested MLflow runs
+            results, test_auc, val_auc, test_acc, val_acc = train(datasets, i, config)
+            
+            all_test_auc.append(test_auc)
+            all_val_auc.append(val_auc)
+            all_test_acc.append(test_acc)
+            all_val_acc.append(val_acc)
+            
+            # Save results for this fold
+            filename = os.path.join(config.results_dir, "split_{}_results.pkl".format(i))
+            # NOTE: save_pkl is assumed to be defined in utils.file_utils
+            save_pkl(filename, results) 
         
-        all_test_auc.append(test_auc)
-        all_val_auc.append(val_auc)
-        all_test_acc.append(test_acc)
-        all_val_acc.append(val_acc)
+        # Save and log final summary
+        final_df = pd.DataFrame({
+            "folds": folds,
+            "test_auc": all_test_auc,
+            "val_auc": all_val_auc,
+            "test_acc": all_test_acc,
+            "val_acc": all_val_acc,
+        })
         
-        # Save results for this fold
-        filename = os.path.join(config.results_dir, "split_{}_results.pkl".format(i))
-        save_pkl(filename, results)
-    
-    # Save summary
-    final_df = pd.DataFrame({
-        "folds": folds,
-        "test_auc": all_test_auc,
-        "val_auc": all_val_auc,
-        "test_acc": all_test_acc,
-        "val_acc": all_val_acc,
-    })
-    
-    if len(folds) != config.k:
-        save_name = "summary_partial_{}_{}.csv".format(config.start_fold, config.end_fold)
-    else:
-        save_name = "summary.csv"
+        if len(folds) != config.k:
+            save_name = "summary_partial_{}_{}.csv".format(config.start_fold, config.end_fold)
+        else:
+            save_name = "summary.csv"
+            
+        final_summary_path = os.path.join(config.results_dir, save_name)
+        final_df.to_csv(final_summary_path)
         
-    final_df.to_csv(os.path.join(config.results_dir, save_name))
-    
-    return {
-        'test_auc': all_test_auc,
-        'val_auc': all_val_auc, 
-        'test_acc': all_test_acc,
-        'val_acc': all_val_acc,
-        'final_df': final_df
-    }
+        # ====================================================================
+        # MLFLOW INTEGRATION: Log final cross-validation statistics
+        # ====================================================================
+        mlflow.set_tag("Training Info", f"CLAM model training with {config.data_set_name} data")
+        mlflow.log_artifact(final_summary_path)
+
+        mlflow.log_metric("CV_Test_AUC_Mean", np.mean(all_test_auc))
+        mlflow.log_metric("CV_Test_AUC_Std", np.std(all_test_auc))
+        mlflow.log_metric("CV_Test_Accuracy_Mean", np.mean(all_test_acc))
+        mlflow.log_metric("CV_Test_Accuracy_Std", np.std(all_test_acc))
+        mlflow.log_metric("CV_Val_AUC_Mean", np.mean(all_val_auc))
+        mlflow.log_metric("CV_Val_AUC_Std", np.std(all_val_auc))
+
+        return {
+            'test_auc': all_test_auc,
+            'val_auc': all_val_auc, 
+            'test_acc': all_test_acc,
+            'val_acc': all_val_acc,
+            'final_df': final_df
+        }
 
 
 def seed_torch(seed=7):
@@ -297,57 +341,57 @@ def create_parser():
     
     # Training parameters
     parser.add_argument('--max_epochs', type=int, default=200, 
-                       help='maximum number of epochs to train (default: 200)')
+                        help='maximum number of epochs to train (default: 200)')
     parser.add_argument('--lr', type=float, default=1e-4, help='learning rate (default: 0.0001)')
     parser.add_argument('--label_frac', type=float, default=1.0, 
-                       help='fraction of training labels (default: 1.0)')
+                        help='fraction of training labels (default: 1.0)')
     parser.add_argument('--reg', type=float, default=1e-5, help='weight decay (default: 1e-5)')
     parser.add_argument('--seed', type=int, default=1, 
-                       help='random seed for reproducible experiment (default: 1)')
+                        help='random seed for reproducible experiment (default: 1)')
     parser.add_argument('--k', type=int, default=10, help='number of folds (default: 10)')
     parser.add_argument('--k_start', type=int, default=-1, help='start fold (default: -1, last fold)')
     parser.add_argument('--k_end', type=int, default=-1, help='end fold (default: -1, first fold)')
     
     # Results and logging
     parser.add_argument('--results_dir', default='./results', 
-                       help='results directory (default: ./results)')
+                        help='results directory (default: ./results)')
     parser.add_argument('--split_dir', type=str, default=None,
-                       help='manually specify the set of splits to use, ' +
-                       'instead of infering from the task and label_frac argument (default: None)')
+                        help='manually specify the set of splits to use, ' +
+                        'instead of infering from the task and label_frac argument (default: None)')
     parser.add_argument('--log_data', action='store_true', default=False, 
-                       help='log data using tensorboard')
+                        help='log data using tensorboard')
     parser.add_argument('--testing', action='store_true', default=False, 
-                       help='debugging tool')
+                        help='debugging tool')
     parser.add_argument('--early_stopping', action='store_true', default=False, 
-                       help='enable early stopping')
+                        help='enable early stopping')
     
     # Model parameters
     parser.add_argument('--opt', type=str, choices=['adam', 'sgd'], default='adam')
     parser.add_argument('--drop_out', type=float, default=0.25, help='dropout')
     parser.add_argument('--bag_loss', type=str, choices=['svm', 'ce'], default='ce',
-                       help='slide-level classification loss function (default: ce)')
+                        help='slide-level classification loss function (default: ce)')
     parser.add_argument('--model_type', type=str, choices=['clam_sb', 'clam_mb', 'mil'], 
-                       default='clam_sb',
-                       help='type of model (default: clam_sb, clam w/ single attention branch)')
+                        default='clam_sb',
+                        help='type of model (default: clam_sb, clam w/ single attention branch)')
     parser.add_argument('--exp_code', type=str, help='experiment code for saving results')
     parser.add_argument('--weighted_sample', action='store_true', default=False, 
-                       help='enable weighted sampling')
+                        help='enable weighted sampling')
     parser.add_argument('--model_size', type=str, choices=['small', 'big'], default='small',
-                       help='size of model, does not affect mil')
+                        help='size of model, does not affect mil')
     parser.add_argument('--task', type=str, 
-                       choices=['task_1_tumor_vs_normal', 'task_2_tumor_subtyping'])
+                        choices=['task_1_tumor_vs_normal', 'task_2_tumor_subtyping'])
     
     # CLAM specific options
     parser.add_argument('--no_inst_cluster', action='store_true', default=False,
-                       help='disable instance-level clustering')
+                        help='disable instance-level clustering')
     parser.add_argument('--inst_loss', type=str, choices=['svm', 'ce', None], default=None,
-                       help='instance-level clustering loss function (default: None)')
+                        help='instance-level clustering loss function (default: None)')
     parser.add_argument('--subtyping', action='store_true', default=False, 
-                       help='subtyping problem')
+                        help='subtyping problem')
     parser.add_argument('--bag_weight', type=float, default=0.7,
-                       help='clam: weight coefficient for bag-level loss (default: 0.7)')
+                        help='clam: weight coefficient for bag-level loss (default: 0.7)')
     parser.add_argument('--B', type=int, default=8,
-                       help='numbr of positive/negative patches to sample for clam')
+                        help='numbr of positive/negative patches to sample for clam')
     
     return parser
 

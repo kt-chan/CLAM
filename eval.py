@@ -1,3 +1,4 @@
+## eval.py (MLflow Integrated)
 from __future__ import print_function
 
 import numpy as np
@@ -17,6 +18,7 @@ from dataset_modules.dataset_generic import (
 )
 import h5py
 from utils.eval_utils import *
+import mlflow # <-- ADDED MLflow import
 
 
 class EvalConfig:
@@ -63,7 +65,8 @@ class EvalConfig:
         
         # Setup directories
         self.save_dir = os.path.join("./eval_results", "EVAL_" + str(self.save_exp_code))
-        self.models_dir = os.path.join(self.results_dir, str(self.models_exp_code))
+        # NOTE: Assumes models_exp_code is in the format EXP_CODE_sSEED, matching the training results dir
+        self.models_dir = os.path.join(self.results_dir, str(self.models_exp_code)) 
         
         os.makedirs(self.save_dir, exist_ok=True)
         
@@ -85,7 +88,7 @@ class EvalConfig:
             self.end_fold = self.k
         else:
             self.end_fold = self.k_end
-        
+            
         # Setup folds to evaluate
         if self.fold == -1:
             self.folds = range(self.start_fold, self.end_fold)
@@ -99,18 +102,22 @@ class EvalConfig:
             "split": self.split,
             "save_dir": self.save_dir,
             "models_dir": self.models_dir,
+            "models_exp_code": self.models_exp_code,
             "model_type": self.model_type,
             "drop_out": self.drop_out,
             "model_size": self.model_size,
+            "k_folds_evaluated": list(self.folds)
         }
 
 
 def setup_eval_dataset(config):
     """Setup dataset for evaluation based on configuration"""
+    data_dir = os.path.join(config.data_root_dir, config.data_set_name)
+    
     if config.task == "task_1_tumor_vs_normal":
         dataset = Generic_MIL_Dataset(
             csv_path="dataset_csv/tumor_vs_normal_dummy_clean.csv",
-            data_dir=os.path.join(config.data_root_dir, config.data_set_name),
+            data_dir=data_dir,
             shuffle=False,
             print_info=True,
             label_dict={"normal_tissue": 0, "tumor_tissue": 1},
@@ -120,7 +127,7 @@ def setup_eval_dataset(config):
     elif config.task == "task_2_tumor_subtyping":
         dataset = Generic_MIL_Dataset(
             csv_path="dataset_csv/tumor_subtyping_dummy_clean.csv",
-            data_dir=os.path.join(config.data_root_dir, config.data_set_name),
+            data_dir=data_dir,
             shuffle=False,
             print_info=True,
             label_dict={"subtype_1": 0, "subtype_2": 1, "subtype_3": 2},
@@ -134,81 +141,115 @@ def setup_eval_dataset(config):
 
 
 def run_evaluation(config):
-    """Main evaluation function"""
-    # Setup device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    """
+    Main evaluation function. Starts the MLflow parent run 
+    for multi-fold evaluation.
+    """
     
-    # Setup dataset
-    dataset = setup_eval_dataset(config)
+    # ====================================================================
+    # MLFLOW INTEGRATION: Start the main run for multi-fold evaluation
+    # ====================================================================
+    experiment_name = f"Eval_{config.exp_code}"
+    mlflow.set_experiment(experiment_name)
     
-    # Log settings
-    settings = config.get_settings()
-    log_file = os.path.join(config.save_dir, "eval_experiment_{}.txt".format(config.save_exp_code))
-    with open(log_file, "w") as f:
-        print(settings, file=f)
-    
-    print("Evaluation Settings:")
-    for key, val in settings.items():
-        print("{}:  {}".format(key, val))
-    
-    # Get checkpoint paths
-    ckpt_paths = [
-        os.path.join(config.models_dir, "s_{}_checkpoint.pt".format(fold)) 
-        for fold in config.folds
-    ]
-    
-    # Dataset split mapping
-    datasets_id = {"train": 0, "val": 1, "test": 2, "all": -1}
-    
-    # Run evaluation across folds
-    all_results = []
-    all_auc = []
-    all_acc = []
-    
-    for ckpt_idx in range(len(ckpt_paths)):
-        # Get the appropriate dataset split
-        if datasets_id[config.split] < 0:
-            split_dataset = dataset
+    run_name = f"Aggregate_{config.split}_from_{config.models_exp_code}"
+    with mlflow.start_run(run_name=run_name) as run:
+        
+        # Setup device
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Setup dataset
+        dataset = setup_eval_dataset(config)
+        
+        # Log settings
+        settings = config.get_settings()
+        
+        # ====================================================================
+        # MLFLOW INTEGRATION: Log all parameters for the aggregate run
+        # ====================================================================
+        mlflow.log_params(settings)
+        
+        log_file = os.path.join(config.save_dir, "eval_experiment_{}.txt".format(config.save_exp_code))
+        with open(log_file, "w") as f:
+            print(settings, file=f)
+        
+        print("Evaluation Settings:")
+        for key, val in settings.items():
+            print("{}:  {}".format(key, val))
+        
+        # Get checkpoint paths
+        ckpt_paths = [
+            os.path.join(config.models_dir, "s_{}_checkpoint.pt".format(fold)) 
+            for fold in config.folds
+        ]
+        
+        # Dataset split mapping
+        datasets_id = {"train": 0, "val": 1, "test": 2, "all": -1}
+        
+        # Run evaluation across folds
+        all_results = []
+        all_auc = []
+        all_acc = []
+        
+        for ckpt_idx in range(len(ckpt_paths)):
+            # Get the appropriate dataset split
+            if datasets_id[config.split] < 0:
+                split_dataset = dataset
+            else:
+                csv_path = "{}/splits_{}.csv".format(config.splits_dir, config.folds[ckpt_idx])
+                datasets = dataset.return_splits(from_id=False, csv_path=csv_path)
+                split_dataset = datasets[datasets_id[config.split]]
+            
+            # Run evaluation (eval function is imported from eval_utils, 
+            # and is assumed to handle nested MLflow logging for the fold)
+            model, patient_results, test_error, auc, df = eval(
+                split_dataset, config, ckpt_paths[ckpt_idx]
+            )
+            
+            all_results.append(patient_results)
+            all_auc.append(auc)
+            all_acc.append(1 - test_error)
+            
+            # Save individual fold results
+            fold_results_path = os.path.join(config.save_dir, "fold_{}.csv".format(config.folds[ckpt_idx]))
+            df.to_csv(
+                fold_results_path,
+                index=False,
+            )
+            # Log the individual fold CSV as an artifact in the *parent* run too
+            mlflow.log_artifact(fold_results_path, artifact_path="fold_results")
+        
+        # Save summary
+        final_df = pd.DataFrame({
+            "folds": config.folds, 
+            "test_auc": all_auc, 
+            "test_acc": all_acc
+        })
+        
+        if len(config.folds) != config.k:
+            save_name = "summary_partial_{}_{}.csv".format(config.folds[0], config.folds[-1])
         else:
-            csv_path = "{}/splits_{}.csv".format(config.splits_dir, config.folds[ckpt_idx])
-            datasets = dataset.return_splits(from_id=False, csv_path=csv_path)
-            split_dataset = datasets[datasets_id[config.split]]
+            save_name = "summary.csv"
+            
+        final_summary_path = os.path.join(config.save_dir, save_name)
+        final_df.to_csv(final_summary_path)
         
-        # Run evaluation
-        model, patient_results, test_error, auc, df = eval(
-            split_dataset, config, ckpt_paths[ckpt_idx]
-        )
+        # ====================================================================
+        # MLFLOW INTEGRATION: Log final aggregate statistics and summary file
+        # ====================================================================
+        mlflow.log_artifact(final_summary_path)
+        mlflow.set_tag("Evaluating Info", f"CLAM model evaluating with {config.data_set_name} data")
+        mlflow.log_metric(f"Aggregate_{config.split}_AUC_Mean", np.mean(all_auc))
+        mlflow.log_metric(f"Aggregate_{config.split}_AUC_Std", np.std(all_auc))
+        mlflow.log_metric(f"Aggregate_{config.split}_Accuracy_Mean", np.mean(all_acc))
+        mlflow.log_metric(f"Aggregate_{config.split}_Accuracy_Std", np.std(all_acc))
         
-        all_results.append(patient_results)
-        all_auc.append(auc)
-        all_acc.append(1 - test_error)
-        
-        # Save individual fold results
-        df.to_csv(
-            os.path.join(config.save_dir, "fold_{}.csv".format(config.folds[ckpt_idx])),
-            index=False,
-        )
-    
-    # Save summary
-    final_df = pd.DataFrame({
-        "folds": config.folds, 
-        "test_auc": all_auc, 
-        "test_acc": all_acc
-    })
-    
-    if len(config.folds) != config.k:
-        save_name = "summary_partial_{}_{}.csv".format(config.folds[0], config.folds[-1])
-    else:
-        save_name = "summary.csv"
-        
-    final_df.to_csv(os.path.join(config.save_dir, save_name))
-    
-    return {
-        'all_results': all_results,
-        'all_auc': all_auc,
-        'all_acc': all_acc,
-        'final_df': final_df
-    }
+        return {
+            'all_results': all_results,
+            'all_auc': all_auc,
+            'all_acc': all_acc,
+            'final_df': final_df
+        }
 
 
 def create_parser():

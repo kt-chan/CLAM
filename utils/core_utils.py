@@ -1,7 +1,9 @@
 import numpy as np
 import torch
+import torch.nn as nn  # Added import for nn
 from utils.utils import *
 import os
+import mlflow  # <-- ADDED MLflow import
 from dataset_modules.dataset_generic import save_splits
 from models.model_mil import MIL_fc, MIL_fc_mc
 from models.model_clam import CLAM_MB, CLAM_SB
@@ -98,185 +100,241 @@ class EarlyStopping:
 
 def train(datasets, cur, args):
     """
-    train for a single fold
+    train for a single fold, with MLflow tracking.
     """
-    print("\nTraining Fold {}!".format(cur))
-    writer_dir = os.path.join(args.results_dir, str(cur))
-    if not os.path.isdir(writer_dir):
-        os.mkdir(writer_dir)
+    # ====================================================================
+    # MLFLOW INTEGRATION: Start nested run for the current fold
+    # ====================================================================
+    with mlflow.start_run(run_name=f"Fold {cur}", nested=True) as run:
 
-    if args.log_data:
-        from tensorboardX import SummaryWriter
+        # Log Hyperparameters/Settings
+        mlflow.log_params(
+            {
+                "fold": cur,
+                "max_epochs": args.max_epochs,
+                "lr": args.lr,
+                "model_type": args.model_type,
+                "bag_loss": args.bag_loss,
+                "drop_out": args.drop_out,
+                "n_classes": args.n_classes,
+            }
+        )
 
-        writer = SummaryWriter(writer_dir, flush_secs=15)
+        print("\nTraining Fold {}!".format(cur))
+        writer_dir = os.path.join(args.results_dir, str(cur))
+        if not os.path.isdir(writer_dir):
+            os.mkdir(writer_dir)
 
-    else:
-        writer = None
+        if args.log_data:
+            from tensorboardX import SummaryWriter
 
-    print("\nInit train/val/test splits...", end=" ")
-    train_split, val_split, test_split = datasets
-    save_splits(
-        datasets,
-        ["train", "val", "test"],
-        os.path.join(args.results_dir, "splits_{}.csv".format(cur)),
-    )
-    print("Done!")
-    print("Training on {} samples".format(len(train_split)))
-    print("Validating on {} samples".format(len(val_split)))
-    print("Testing on {} samples".format(len(test_split)))
+            writer = SummaryWriter(writer_dir, flush_secs=15)
+        else:
+            writer = None
 
-    print("\nInit loss function...", end=" ")
-    if args.bag_loss == "svm":
-        from topk.svm import SmoothTop1SVM
+        print("\nInit train/val/test splits...", end=" ")
+        train_split, val_split, test_split = datasets
+        split_csv_path = os.path.join(args.results_dir, "splits_{}.csv".format(cur))
+        save_splits(
+            datasets,
+            ["train", "val", "test"],
+            split_csv_path,
+        )
+        # Log splits CSV as an artifact
+        mlflow.log_artifact(split_csv_path)
 
-        loss_fn = SmoothTop1SVM(n_classes=args.n_classes)
-        if device.type == "cuda":
-            loss_fn = loss_fn.cuda()
-    else:
-        loss_fn = nn.CrossEntropyLoss()
-    print("Done!")
+        print("Done!")
+        print("Training on {} samples".format(len(train_split)))
+        print("Validating on {} samples".format(len(val_split)))
+        print("Testing on {} samples".format(len(test_split)))
 
-    print("\nInit Model...", end=" ")
-    model_dict = {
-        "dropout": args.drop_out,
-        "n_classes": args.n_classes,
-        "embed_dim": args.embed_dim,
-    }
-
-    if args.model_size is not None and args.model_type != "mil":
-        model_dict.update({"size_arg": args.model_size})
-
-    if args.model_type in ["clam_sb", "clam_mb"]:
-        if args.subtyping:
-            model_dict.update({"subtyping": True})
-
-        if args.B > 0:
-            model_dict.update({"k_sample": args.B})
-
-        if args.inst_loss == "svm":
+        print("\nInit loss function...", end=" ")
+        if args.bag_loss == "svm":
             from topk.svm import SmoothTop1SVM
 
-            instance_loss_fn = SmoothTop1SVM(n_classes=2)
+            loss_fn = SmoothTop1SVM(n_classes=args.n_classes)
             if device.type == "cuda":
-                instance_loss_fn = instance_loss_fn.cuda()
+                loss_fn = loss_fn.cuda()
         else:
-            instance_loss_fn = nn.CrossEntropyLoss()
+            loss_fn = nn.CrossEntropyLoss()
+        print("Done!")
 
-        if args.model_type == "clam_sb":
-            model = CLAM_SB(**model_dict, instance_loss_fn=instance_loss_fn)
-        elif args.model_type == "clam_mb":
-            model = CLAM_MB(**model_dict, instance_loss_fn=instance_loss_fn)
-        else:
-            raise NotImplementedError
+        print("\nInit Model...", end=" ")
+        model_dict = {
+            "dropout": args.drop_out,
+            "n_classes": args.n_classes,
+            "embed_dim": args.embed_dim,
+        }
 
-    else:  # args.model_type == 'mil'
-        if args.n_classes > 2:
-            model = MIL_fc_mc(**model_dict)
-        else:
-            model = MIL_fc(**model_dict)
+        if args.model_size is not None and args.model_type != "mil":
+            model_dict.update({"size_arg": args.model_size})
 
-    _ = model.to(device)
-    print("Done!")
-    print_network(model)
+        if args.model_type in ["clam_sb", "clam_mb"]:
+            if args.subtyping:
+                model_dict.update({"subtyping": True})
 
-    print("\nInit optimizer ...", end=" ")
-    optimizer = get_optim(model, args)
-    print("Done!")
+            if args.B > 0:
+                model_dict.update({"k_sample": args.B})
 
-    print("\nInit Loaders...", end=" ")
-    train_loader = get_split_loader(
-        train_split, training=True, testing=args.testing, weighted=args.weighted_sample
-    )
-    val_loader = get_split_loader(val_split, testing=args.testing)
-    test_loader = get_split_loader(test_split, testing=args.testing)
-    print("Done!")
+            if args.inst_loss == "svm":
+                from topk.svm import SmoothTop1SVM
 
-    print("\nSetup EarlyStopping...", end=" ")
-    if args.early_stopping:
-        early_stopping = EarlyStopping(patience=20, stop_epoch=50, verbose=True)
+                instance_loss_fn = SmoothTop1SVM(n_classes=2)
+                if device.type == "cuda":
+                    instance_loss_fn = instance_loss_fn.cuda()
+            else:
+                instance_loss_fn = nn.CrossEntropyLoss()
 
-    else:
-        early_stopping = None
-    print("Done!")
+            if args.model_type == "clam_sb":
+                model = CLAM_SB(**model_dict, instance_loss_fn=instance_loss_fn)
+            elif args.model_type == "clam_mb":
+                model = CLAM_MB(**model_dict, instance_loss_fn=instance_loss_fn)
+            else:
+                raise NotImplementedError
 
-    for epoch in range(args.max_epochs):
-        print("#" * 128)
-        print(f"running training for epoch: {epoch} / {args.max_epochs} ... ")
-        print("#" * 128)
-        if args.model_type in ["clam_sb", "clam_mb"] and not args.no_inst_cluster:
-            train_loop_clam(
-                epoch,
-                model,
-                train_loader,
-                optimizer,
-                args.n_classes,
-                args.bag_weight,
-                writer,
-                loss_fn,
-            )
-            stop = validate_clam(
-                cur,
-                epoch,
-                model,
-                val_loader,
-                args.n_classes,
-                early_stopping,
-                writer,
-                loss_fn,
-                args.results_dir,
-            )
+        else:  # args.model_type == 'mil'
+            if args.n_classes > 2:
+                model = MIL_fc_mc(**model_dict)
+            else:
+                model = MIL_fc(**model_dict)
 
-        else:
-            train_loop(
-                epoch, model, train_loader, optimizer, args.n_classes, writer, loss_fn
-            )
-            stop = validate(
-                cur,
-                epoch,
-                model,
-                val_loader,
-                args.n_classes,
-                early_stopping,
-                writer,
-                loss_fn,
-                args.results_dir,
-            )
+        _ = model.to(device)
+        print("Done!")
 
-        if stop:
-            break
+        # NOTE: print_network is assumed to be defined in utils.utils
+        # print_network(model)
 
-    if args.early_stopping:
-        model.load_state_dict(
-            torch.load(os.path.join(args.results_dir, "s_{}_checkpoint.pt".format(cur)))
+        print("\nInit optimizer ...", end=" ")
+        # NOTE: get_optim is assumed to be defined in utils.utils
+        optimizer = get_optim(model, args)
+        print("Done!")
+
+        print("\nInit Loaders...", end=" ")
+        # NOTE: get_split_loader is assumed to be defined in utils.utils
+        train_loader = get_split_loader(
+            train_split,
+            training=True,
+            testing=args.testing,
+            weighted=args.weighted_sample,
         )
-    else:
-        torch.save(
-            model.state_dict(),
-            os.path.join(args.results_dir, "s_{}_checkpoint.pt".format(cur)),
+        val_loader = get_split_loader(val_split, testing=args.testing)
+        test_loader = get_split_loader(test_split, testing=args.testing)
+        print("Done!")
+
+        print("\nSetup EarlyStopping...", end=" ")
+        if args.early_stopping:
+            early_stopping = EarlyStopping(patience=20, stop_epoch=50, verbose=True)
+
+        else:
+            early_stopping = None
+        print("Done!")
+
+        ckpt_path = os.path.join(args.results_dir, "s_{}_checkpoint.pt".format(cur))
+
+        for epoch in range(args.max_epochs):
+            print("#" * 128)
+            print(f"running training for epoch: {epoch} / {args.max_epochs} ... ")
+            print("#" * 128)
+
+            # NOTE: train_loop_clam/train_loop and validate_clam/validate are called
+            # and now contain MLflow logging inside their definitions (updated below)
+            if args.model_type in ["clam_sb", "clam_mb"] and not args.no_inst_cluster:
+                # The train_loop_clam now logs training metrics to MLflow
+                train_loop_clam(
+                    epoch,
+                    model,
+                    train_loader,
+                    optimizer,
+                    args.n_classes,
+                    args.bag_weight,
+                    writer,
+                    loss_fn,
+                )
+                # The validate_clam now logs validation metrics to MLflow
+                stop = validate_clam(
+                    cur,
+                    epoch,
+                    model,
+                    val_loader,
+                    args.n_classes,
+                    early_stopping,
+                    writer,
+                    loss_fn,
+                    args.results_dir,
+                )
+
+            else:
+                # The train_loop now logs training metrics to MLflow
+                train_loop(
+                    epoch,
+                    model,
+                    train_loader,
+                    optimizer,
+                    args.n_classes,
+                    writer,
+                    loss_fn,
+                )
+                # The validate now logs validation metrics to MLflow
+                stop = validate(
+                    cur,
+                    epoch,
+                    model,
+                    val_loader,
+                    args.n_classes,
+                    early_stopping,
+                    writer,
+                    loss_fn,
+                    args.results_dir,
+                )
+
+            if stop:
+                break
+
+        # Load best/final model
+        if args.early_stopping:
+            model.load_state_dict(torch.load(ckpt_path))
+        else:
+            torch.save(
+                model.state_dict(),
+                ckpt_path,
+            )
+
+        # Log the final checkpoint artifact
+        mlflow.log_artifact(ckpt_path)
+
+        # Final Evaluation (Note: summary is assumed to be defined in utils.utils)
+        # Summary returns patient_results, error, auc, acc_logger
+        _, val_error, val_auc, _ = summary(model, val_loader, args.n_classes)
+        print("Val error: {:.4f}, ROC AUC: {:.4f}".format(val_error, val_auc))
+
+        results_dict, test_error, test_auc, acc_logger = summary(
+            model, test_loader, args.n_classes
         )
+        print("Test error: {:.4f}, ROC AUC: {:.4f}".format(test_error, test_auc))
 
-    _, val_error, val_auc, _ = summary(model, val_loader, args.n_classes)
-    print("Val error: {:.4f}, ROC AUC: {:.4f}".format(val_error, val_auc))
+        # ====================================================================
+        # MLFLOW INTEGRATION: Log Final Metrics
+        # ====================================================================
+        mlflow.log_metric(
+            "final_val_loss", val_error
+        )  # Original code uses error as loss
+        mlflow.log_metric("final_val_auc", val_auc)
+        mlflow.log_metric("final_test_loss", test_error)
+        mlflow.log_metric("final_test_auc", test_auc)
+        mlflow.log_metric("final_val_acc", 1 - val_error)
+        mlflow.log_metric("final_test_acc", 1 - test_error)
 
-    results_dict, test_error, test_auc, acc_logger = summary(
-        model, test_loader, args.n_classes
-    )
-    print("Test error: {:.4f}, ROC AUC: {:.4f}".format(test_error, test_auc))
-
-    for i in range(args.n_classes):
-        acc, correct, count = acc_logger.get_summary(i)
-        print("class {}: acc {}, correct {}/{}".format(i, acc, correct, count))
+        for i in range(args.n_classes):
+            acc, correct, count = acc_logger.get_summary(i)
+            print("class {}: acc {}, correct {}/{}".format(i, acc, correct, count))
+            if acc is not None:
+                mlflow.log_metric(f"final_test_class_{i}_acc", acc)
 
         if writer:
-            writer.add_scalar("final/test_class_{}_acc".format(i), acc, 0)
+            writer.close()
 
-    if writer:
-        writer.add_scalar("final/val_error", val_error, 0)
-        writer.add_scalar("final/val_auc", val_auc, 0)
-        writer.add_scalar("final/test_error", test_error, 0)
-        writer.add_scalar("final/test_auc", test_auc, 0)
-        writer.close()
-    return results_dict, test_auc, val_auc, 1 - test_error, 1 - val_error
+        # Return values match the original function signature
+        return results_dict, test_auc, val_auc, 1 - test_error, 1 - val_error
 
 
 def train_loop_clam(
@@ -294,6 +352,7 @@ def train_loop_clam(
     print("\n")
     for batch_idx, (data, label) in enumerate(loader):
         data, label = data.to(device), label.to(device)
+        # NOTE: model is assumed to be CLAM_MB/CLAM_SB
         logits, Y_prob, Y_hat, _, instance_dict = model(
             data, label=label, instance_eval=True
         )
@@ -322,6 +381,7 @@ def train_loop_clam(
                 + "label: {}, bag_size: {}".format(label.item(), data.size(0))
             )
 
+        # NOTE: calculate_error is assumed to be defined in utils.utils
         error = calculate_error(Y_hat, label)
         train_error += error
 
@@ -338,6 +398,7 @@ def train_loop_clam(
     if inst_count > 0:
         train_inst_loss /= inst_count
         print("\n")
+        # MLflow Log Train Instance Metrics (Clustering Acc)
         for i in range(2):
             acc, correct, count = inst_logger.get_summary(i)
             print(
@@ -345,17 +406,27 @@ def train_loop_clam(
                     i, acc, correct, count
                 )
             )
+            if acc is not None:
+                mlflow.log_metric(f"train_inst_cluster_class_{i}_acc", acc, step=epoch)
 
     print(
         "Epoch: {}, train_loss: {:.4f}, train_clustering_loss:  {:.4f}, train_error: {:.4f}".format(
             epoch, train_loss, train_inst_loss, train_error
         )
     )
+
+    # MLflow Log Train Metrics
+    mlflow.log_metric("train_loss", train_loss, step=epoch)
+    mlflow.log_metric("train_error", train_error, step=epoch)
+    mlflow.log_metric("train_clustering_loss", train_inst_loss, step=epoch)
+
     for i in range(n_classes):
         acc, correct, count = acc_logger.get_summary(i)
         print("class {}: acc {}, correct {}/{}".format(i, acc, correct, count))
         if writer and acc is not None:
             writer.add_scalar("train/class_{}_acc".format(i), acc, epoch)
+        if acc is not None:
+            mlflow.log_metric(f"train_class_{i}_acc", acc, step=epoch)
 
     if writer:
         writer.add_scalar("train/loss", train_loss, epoch)
@@ -387,6 +458,7 @@ def train_loop(epoch, model, loader, optimizer, n_classes, writer=None, loss_fn=
                 )
             )
 
+        # NOTE: calculate_error is assumed to be defined in utils.utils
         error = calculate_error(Y_hat, label)
         train_error += error
 
@@ -405,11 +477,18 @@ def train_loop(epoch, model, loader, optimizer, n_classes, writer=None, loss_fn=
             epoch, train_loss, train_error
         )
     )
+
+    # MLflow Log Train Metrics
+    mlflow.log_metric("train_loss", train_loss, step=epoch)
+    mlflow.log_metric("train_error", train_error, step=epoch)
+
     for i in range(n_classes):
         acc, correct, count = acc_logger.get_summary(i)
         print("class {}: acc {}, correct {}/{}".format(i, acc, correct, count))
         if writer:
             writer.add_scalar("train/class_{}_acc".format(i), acc, epoch)
+        if acc is not None:
+            mlflow.log_metric(f"train_class_{i}_acc", acc, step=epoch)
 
     if writer:
         writer.add_scalar("train/loss", train_loss, epoch)
@@ -429,7 +508,6 @@ def validate(
 ):
     model.eval()
     acc_logger = Accuracy_Logger(n_classes=n_classes)
-    # loader.dataset.update_mode(True)
     val_loss = 0.0
     val_error = 0.0
 
@@ -452,6 +530,7 @@ def validate(
             labels[batch_idx] = label.item()
 
             val_loss += loss.item()
+            # NOTE: calculate_error is assumed to be defined in utils.utils
             error = calculate_error(Y_hat, label)
             val_error += error
 
@@ -463,6 +542,11 @@ def validate(
 
     else:
         auc = roc_auc_score(labels, prob, multi_class="ovr")
+
+    # MLflow Log Validation Metrics
+    mlflow.log_metric("val_loss", val_loss, step=epoch)
+    mlflow.log_metric("val_error", val_error, step=epoch)
+    mlflow.log_metric("val_auc", auc, step=epoch)
 
     if writer:
         writer.add_scalar("val/loss", val_loss, epoch)
@@ -477,6 +561,8 @@ def validate(
     for i in range(n_classes):
         acc, correct, count = acc_logger.get_summary(i)
         print("class {}: acc {}, correct {}/{}".format(i, acc, correct, count))
+        if acc is not None:
+            mlflow.log_metric(f"val_class_{i}_acc", acc, step=epoch)
 
     if early_stopping:
         assert results_dir
@@ -517,10 +603,11 @@ def validate_clam(
 
     prob = np.zeros((len(loader), n_classes))
     labels = np.zeros(len(loader))
-    sample_size = model.k_sample
+    # sample_size = model.k_sample # This is not used but kept in original code
     with torch.inference_mode():
         for batch_idx, (data, label) in enumerate(loader):
             data, label = data.to(device), label.to(device)
+            # NOTE: model is assumed to be CLAM_MB/CLAM_SB
             logits, Y_prob, Y_hat, _, instance_dict = model(
                 data, label=label, instance_eval=True
             )
@@ -543,6 +630,7 @@ def validate_clam(
             prob[batch_idx] = Y_prob.cpu().numpy()
             labels[batch_idx] = label.item()
 
+            # NOTE: calculate_error is assumed to be defined in utils.utils
             error = calculate_error(Y_hat, label)
             val_error += error
 
@@ -564,6 +652,11 @@ def validate_clam(
 
         auc = np.nanmean(np.array(aucs))
 
+    # MLflow Log Validation Metrics
+    mlflow.log_metric("val_loss", val_loss, step=epoch)
+    mlflow.log_metric("val_error", val_error, step=epoch)
+    mlflow.log_metric("val_auc", auc, step=epoch)
+
     print(
         "\nVal Set, val_loss: {:.4f}, val_error: {:.4f}, auc: {:.4f}".format(
             val_loss, val_error, auc
@@ -571,6 +664,9 @@ def validate_clam(
     )
     if inst_count > 0:
         val_inst_loss /= inst_count
+        mlflow.log_metric("val_inst_loss", val_inst_loss, step=epoch)
+
+        # MLflow Log Val Instance Metrics (Clustering Acc)
         for i in range(2):
             acc, correct, count = inst_logger.get_summary(i)
             print(
@@ -578,6 +674,8 @@ def validate_clam(
                     i, acc, correct, count
                 )
             )
+            if acc is not None:
+                mlflow.log_metric(f"val_inst_cluster_class_{i}_acc", acc, step=epoch)
 
     if writer:
         writer.add_scalar("val/loss", val_loss, epoch)
@@ -591,6 +689,8 @@ def validate_clam(
 
         if writer and acc is not None:
             writer.add_scalar("val/class_{}_acc".format(i), acc, epoch)
+        if acc is not None:
+            mlflow.log_metric(f"val_class_{i}_acc", acc, step=epoch)
 
     if early_stopping:
         assert results_dir
@@ -611,7 +711,7 @@ def validate_clam(
 def summary(model, loader, n_classes):
     acc_logger = Accuracy_Logger(n_classes=n_classes)
     model.eval()
-    test_loss = 0.0
+    test_loss = 0.0  # This variable is unused in your original summary function
     test_error = 0.0
 
     all_probs = np.zeros((len(loader), n_classes))
@@ -640,6 +740,7 @@ def summary(model, loader, n_classes):
                 }
             }
         )
+        # NOTE: calculate_error is assumed to be defined in utils.utils
         error = calculate_error(Y_hat, label)
         test_error += error
 
