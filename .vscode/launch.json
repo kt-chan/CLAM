@@ -39,7 +39,7 @@
             "name": "3. Model Training",
             "type": "debugpy",
             "request": "launch",
-            "program": "main.py",
+            "program": "train.py",
             "console": "integratedTerminal",
             "python": "${command:python.interpreterPath}",
             // --- Environment Variable for GPU ---
