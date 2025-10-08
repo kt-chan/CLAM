@@ -50,7 +50,7 @@
             // --- Script Arguments ---
             "args": [
                 "--max_epochs",
-                "10",
+                "1",
                 "--drop_out",
                 "0.25",
                 "--early_stopping",
