@@ -1,24 +1,18 @@
 from __future__ import print_function
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Dict, List, Any, Tuple, Union
 import json
 
 import numpy as np
 import argparse
 import torch
-import torch.nn as nn
-import pdb
 import os
 import pandas as pd
 from train import reconstruct_clam_model
 from utils.utils import *
-from math import floor
 import matplotlib.pyplot as plt
 from dataset_modules.dataset_generic import (
-    Generic_WSI_Classification_Dataset,
     Generic_MIL_Dataset,
-    save_splits,
 )
-import h5py
 from utils.eval_utils import *
 import mlflow
 from mlflow.models.signature import infer_signature
@@ -27,18 +21,57 @@ import seaborn as sns
 
 
 class EvalConfig:
-    """Configuration class for evaluation"""
+    """Configuration class for evaluation with strong type hints."""
 
-    def __init__(self, **kwargs):
+    # Data parameters
+    data_root_dir: Optional[str]
+    data_set_name: Optional[str]
+
+    # Results and paths
+    results_dir: str
+    save_exp_code: Optional[str]
+    models_exp_code: Optional[str]
+    splits_dir: Optional[str]
+
+    # Model parameters
+    model_size: str
+    model_type: str
+    drop_out: float
+    embed_dim: int
+
+    # Evaluation parameters
+    k: int
+    k_start: int
+    k_end: int
+    fold: int
+    micro_average: bool
+    split: str
+    task: Optional[str]
+    subtyping: bool
+
+    # MLflow model registration parameters
+    registered_model_name: Optional[str]
+    register_best_model: bool
+    detailed_metrics: bool
+
+    # Derived attributes
+    n_classes: Optional[int]
+    save_dir: str
+    models_dir: str
+    start_fold: int
+    end_fold: int
+    folds: range
+
+    def __init__(self, **kwargs) -> None:
         # Data parameters
-        self.data_root_dir = kwargs.get("data_root_dir", None)
-        self.data_set_name = kwargs.get("data_set_name", None)
+        self.data_root_dir = kwargs.get("data_root_dir")
+        self.data_set_name = kwargs.get("data_set_name")
 
         # Results and paths
         self.results_dir = kwargs.get("results_dir", "./results")
-        self.save_exp_code = kwargs.get("save_exp_code", None)
-        self.models_exp_code = kwargs.get("models_exp_code", None)
-        self.splits_dir = kwargs.get("splits_dir", None)
+        self.save_exp_code = kwargs.get("save_exp_code")
+        self.models_exp_code = kwargs.get("models_exp_code")
+        self.splits_dir = kwargs.get("splits_dir")
 
         # Model parameters
         self.model_size = kwargs.get("model_size", "small")
@@ -53,19 +86,19 @@ class EvalConfig:
         self.fold = kwargs.get("fold", -1)
         self.micro_average = kwargs.get("micro_average", False)
         self.split = kwargs.get("split", "test")
-        self.task = kwargs.get("task", None)
+        self.task = kwargs.get("task")
         self.subtyping = kwargs.get("subtyping", False)
 
         # MLflow model registration parameters
-        self.registered_model_name: Optional[str] = kwargs.get("registered_model_name")
-        self.register_best_model: bool = kwargs.get("register_best_model", True)
-        self.detailed_metrics: bool = kwargs.get("detailed_metrics", True)
+        self.registered_model_name = kwargs.get("registered_model_name")
+        self.register_best_model = kwargs.get("register_best_model", True)
+        self.detailed_metrics = kwargs.get("detailed_metrics", True)
 
-        # Derived attributes
+        # Setup derived attributes
         self._setup_derived_attributes()
 
-    def _setup_derived_attributes(self):
-        """Setup derived attributes and paths"""
+    def _setup_derived_attributes(self) -> None:
+        """Setup derived attributes and paths."""
         # Set number of classes based on task
         if self.task == "task_1_tumor_vs_normal":
             self.n_classes = 2
@@ -75,10 +108,7 @@ class EvalConfig:
             self.n_classes = None
 
         # Setup directories
-        self.save_dir = os.path.join(
-            "./eval_results", "EVAL_" + str(self.save_exp_code)
-        )
-
+        self.save_dir = os.path.join("./eval_results", f"EVAL_{self.save_exp_code}")
         self.models_dir = os.path.join(self.results_dir, str(self.models_exp_code))
 
         # Setup default registered model name
@@ -100,15 +130,8 @@ class EvalConfig:
         ), f"Splits directory {self.splits_dir} does not exist"
 
         # Setup fold ranges
-        if self.k_start == -1:
-            self.start_fold = 0
-        else:
-            self.start_fold = self.k_start
-
-        if self.k_end == -1:
-            self.end_fold = self.k
-        else:
-            self.end_fold = self.k_end
+        self.start_fold = 0 if self.k_start == -1 else self.k_start
+        self.end_fold = self.k if self.k_end == -1 else self.k_end
 
         # Setup folds to evaluate
         if self.fold == -1:
@@ -116,8 +139,8 @@ class EvalConfig:
         else:
             self.folds = range(self.fold, self.fold + 1)
 
-    def get_settings(self):
-        """Return settings dictionary for logging"""
+    def get_settings(self) -> Dict[str, Any]:
+        """Return settings dictionary for logging."""
         return {
             "task": self.task,
             "split": self.split,
@@ -132,9 +155,9 @@ class EvalConfig:
         }
 
 
-def setup_eval_dataset(config):
-    """Setup dataset for evaluation based on configuration"""
-    data_dir = os.path.join(config.data_root_dir, config.data_set_name)
+def setup_eval_dataset(config: EvalConfig) -> Generic_MIL_Dataset:
+    """Setup dataset for evaluation based on configuration."""
+    data_dir: str = os.path.join(config.data_root_dir, config.data_set_name)
 
     if config.task == "task_1_tumor_vs_normal":
         dataset = Generic_MIL_Dataset(
@@ -166,18 +189,16 @@ def create_detailed_metrics_artifacts(
     all_labels: np.ndarray,
     all_preds: np.ndarray,
     all_probs: np.ndarray,
-    config,
+    config: EvalConfig,
     fold: int,
-) -> Dict[str, Any]:
-    """
-    Create detailed evaluation metrics and artifacts for MLflow logging
-    """
-    metrics_dict = {}
-    artifacts = {}
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """Create detailed evaluation metrics and artifacts for MLflow logging."""
+    metrics_dict: Dict[str, Any] = {}
+    artifacts: Dict[str, str] = {}
 
     try:
         # Classification report
-        class_report = classification_report(
+        class_report: Dict[str, Any] = classification_report(
             all_labels, all_preds, output_dict=True, zero_division=0
         )
         metrics_dict["classification_report"] = class_report
@@ -185,18 +206,13 @@ def create_detailed_metrics_artifacts(
         # Log per-class metrics
         for class_idx in range(config.n_classes):
             if str(class_idx) in class_report:
-                metrics_dict[f"class_{class_idx}_precision"] = class_report[
-                    str(class_idx)
-                ]["precision"]
-                metrics_dict[f"class_{class_idx}_recall"] = class_report[
-                    str(class_idx)
-                ]["recall"]
-                metrics_dict[f"class_{class_idx}_f1_score"] = class_report[
-                    str(class_idx)
-                ]["f1-score"]
-                metrics_dict[f"class_{class_idx}_support"] = class_report[
-                    str(class_idx)
-                ]["support"]
+                class_metrics: Dict[str, float] = class_report[str(class_idx)]
+                metrics_dict[f"class_{class_idx}_precision"] = class_metrics[
+                    "precision"
+                ]
+                metrics_dict[f"class_{class_idx}_recall"] = class_metrics["recall"]
+                metrics_dict[f"class_{class_idx}_f1_score"] = class_metrics["f1-score"]
+                metrics_dict[f"class_{class_idx}_support"] = class_metrics["support"]
 
         # Overall metrics
         metrics_dict["overall_accuracy"] = class_report["accuracy"]
@@ -210,7 +226,7 @@ def create_detailed_metrics_artifacts(
         metrics_dict["weighted_avg_f1_score"] = class_report["weighted avg"]["f1-score"]
 
         # Confusion matrix
-        cm = confusion_matrix(all_labels, all_preds)
+        cm: np.ndarray = confusion_matrix(all_labels, all_preds)
         metrics_dict["confusion_matrix"] = cm.tolist()
 
         # Create confusion matrix plot
@@ -219,7 +235,9 @@ def create_detailed_metrics_artifacts(
         plt.title(f"Confusion Matrix - Fold {fold}")
         plt.ylabel("True Label")
         plt.xlabel("Predicted Label")
-        cm_path = os.path.join(config.save_dir, f"confusion_matrix_fold_{fold}.png")
+        cm_path: str = os.path.join(
+            config.save_dir, f"confusion_matrix_fold_{fold}.png"
+        )
         plt.savefig(cm_path, bbox_inches="tight", dpi=300)
         plt.close()
         artifacts["confusion_matrix"] = cm_path
@@ -229,7 +247,7 @@ def create_detailed_metrics_artifacts(
             from sklearn.metrics import roc_curve
 
             fpr, tpr, thresholds = roc_curve(all_labels, all_probs[:, 1])
-            roc_data = {
+            roc_data: Dict[str, List[float]] = {
                 "fpr": fpr.tolist(),
                 "tpr": tpr.tolist(),
                 "thresholds": thresholds.tolist(),
@@ -246,13 +264,13 @@ def create_detailed_metrics_artifacts(
             plt.ylabel("True Positive Rate")
             plt.title(f"ROC Curve - Fold {fold}")
             plt.legend(loc="lower right")
-            roc_path = os.path.join(config.save_dir, f"roc_curve_fold_{fold}.png")
+            roc_path: str = os.path.join(config.save_dir, f"roc_curve_fold_{fold}.png")
             plt.savefig(roc_path, bbox_inches="tight", dpi=300)
             plt.close()
             artifacts["roc_curve"] = roc_path
 
         # Save detailed metrics as JSON
-        metrics_json_path = os.path.join(
+        metrics_json_path: str = os.path.join(
             config.save_dir, f"detailed_metrics_fold_{fold}.json"
         )
         with open(metrics_json_path, "w") as f:
@@ -266,31 +284,28 @@ def create_detailed_metrics_artifacts(
 
 
 def log_best_model_to_mlflow(
-    config,
+    config: EvalConfig,
     all_auc: List[float],
     all_acc: List[float],
-    all_detailed_metrics: List[Dict],
+    all_detailed_metrics: List[Dict[str, Any]],
     folds: List[int],
     ckpt_paths: List[str],
-):
-    """
-    Identify the best model from evaluation results and log it to MLflow
-    using a manually inferred signature.
-    """
+) -> Optional[torch.nn.Module]:
+    """Identify the best model from evaluation results and log it to MLflow."""
     if not config.register_best_model:
         print("Model registration is disabled. Skipping...")
         return None
 
     # Find the best fold based on evaluation AUC
-    best_fold_idx = np.argmax(all_auc)
-    best_fold = folds[best_fold_idx]
-    best_auc = all_auc[best_fold_idx]
-    best_acc = all_acc[best_fold_idx]
+    best_fold_idx: int = np.argmax(all_auc)
+    best_fold: int = folds[best_fold_idx]
+    best_auc: float = all_auc[best_fold_idx]
+    best_acc: float = all_acc[best_fold_idx]
 
     print(f"Best model from fold {best_fold} with {config.split} AUC: {best_auc:.4f}")
 
     # Load the best model checkpoint
-    best_model_checkpoint_path = ckpt_paths[best_fold_idx]
+    best_model_checkpoint_path: str = ckpt_paths[best_fold_idx]
 
     if not os.path.exists(best_model_checkpoint_path):
         print(
@@ -300,7 +315,7 @@ def log_best_model_to_mlflow(
 
     try:
         # Define explicit requirements
-        pip_reqs = [
+        pip_reqs: List[str] = [
             "timm==0.9.8",
             "torch==2.8.0+cu128",
             "torchvision==0.23.0+cu128",
@@ -311,20 +326,24 @@ def log_best_model_to_mlflow(
         ]
 
         # Create dummy input for signature inference
-        L = 500  # number of instances (patches)
-        D = config.embed_dim
-        dummy_input_np = np.random.randn(L, D).astype(np.float32)
-        dummy_input_torch = torch.from_numpy(dummy_input_np)
+        L: int = 500  # number of instances (patches)
+        D: int = config.embed_dim
+        dummy_input_np: np.ndarray = np.random.randn(L, D).astype(np.float32)
+        dummy_input_torch: torch.Tensor = torch.from_numpy(dummy_input_np)
 
         # Reconstruct the model architecture and load weights
-        best_model = reconstruct_clam_model(config, best_model_checkpoint_path)
+        best_model: torch.nn.Module = reconstruct_clam_model(
+            config, best_model_checkpoint_path
+        )
 
         # Generate signature by passing dummy input through the model
         with torch.no_grad():
-            output = best_model(dummy_input_torch)
-            Y_prob = output[0] if isinstance(output, tuple) else output
+            output: Union[torch.Tensor, Tuple[torch.Tensor, ...]] = best_model(
+                dummy_input_torch
+            )
+            Y_prob: torch.Tensor = output[0] if isinstance(output, tuple) else output
 
-        Y_prob_np = Y_prob.cpu().numpy()
+        Y_prob_np: np.ndarray = Y_prob.cpu().numpy()
         signature = infer_signature(model_input=dummy_input_np, model_output=Y_prob_np)
 
         # Log the reconstructed model using explicit signature
@@ -350,19 +369,21 @@ def log_best_model_to_mlflow(
 
         # Log detailed metrics for the best model if available
         if all_detailed_metrics and best_fold_idx < len(all_detailed_metrics):
-            best_detailed_metrics = all_detailed_metrics[best_fold_idx]
+            best_detailed_metrics: Optional[Dict[str, Any]] = all_detailed_metrics[
+                best_fold_idx
+            ]
             if best_detailed_metrics:
                 mlflow.log_metric(
                     f"best_{config.split}_precision",
-                    best_detailed_metrics.get("macro_avg_precision", 0),
+                    best_detailed_metrics.get("macro_avg_precision", 0.0),
                 )
                 mlflow.log_metric(
                     f"best_{config.split}_recall",
-                    best_detailed_metrics.get("macro_avg_recall", 0),
+                    best_detailed_metrics.get("macro_avg_recall", 0.0),
                 )
                 mlflow.log_metric(
                     f"best_{config.split}_f1_score",
-                    best_detailed_metrics.get("macro_avg_f1_score", 0),
+                    best_detailed_metrics.get("macro_avg_f1_score", 0.0),
                 )
 
         return best_model
@@ -372,101 +393,88 @@ def log_best_model_to_mlflow(
         return None
 
 
-def run_evaluation(config):
-    """
-    Main evaluation function. Starts the MLflow parent run
-    for multi-fold evaluation.
-    """
-
-    # ====================================================================
+def run_evaluation(config: EvalConfig) -> Dict[str, Any]:
+    """Main evaluation function. Starts the MLflow parent run for multi-fold evaluation."""
     # MLFLOW INTEGRATION: Start the main run for multi-fold evaluation
-    # ====================================================================
-    experiment_name = f"Eval_{config.models_exp_code}"
+    experiment_name: str = f"Eval_{config.models_exp_code}"
     mlflow.set_experiment(experiment_name)
 
-    run_name = f"Aggregate_{config.split}_from_{config.models_exp_code}"
+    run_name: str = f"Aggregate_{config.split}_from_{config.models_exp_code}"
     with mlflow.start_run(run_name=run_name) as run:
-
         # Setup device
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device: torch.device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
 
         # Setup dataset
-        dataset = setup_eval_dataset(config)
+        dataset: Generic_MIL_Dataset = setup_eval_dataset(config)
 
         # Log settings
-        settings = config.get_settings()
+        settings: Dict[str, Any] = config.get_settings()
 
-        # ====================================================================
         # MLFLOW INTEGRATION: Log all parameters for the aggregate run
-        # ====================================================================
         mlflow.log_params(settings)
 
-        log_file = os.path.join(
-            config.save_dir, "eval_experiment_{}.txt".format(config.save_exp_code)
+        log_file: str = os.path.join(
+            config.save_dir, f"eval_experiment_{config.save_exp_code}.txt"
         )
         with open(log_file, "w") as f:
             print(settings, file=f)
 
         print("Evaluation Settings:")
         for key, val in settings.items():
-            print("{}:  {}".format(key, val))
+            print(f"{key}:  {val}")
 
         # Get checkpoint paths
-        ckpt_paths = [
-            os.path.join(config.models_dir, "s_{}_checkpoint.pt".format(fold))
+        ckpt_paths: List[str] = [
+            os.path.join(config.models_dir, f"s_{fold}_checkpoint.pt")
             for fold in config.folds
         ]
 
         # Dataset split mapping
-        datasets_id = {"train": 0, "val": 1, "test": 2, "all": -1}
+        datasets_id: Dict[str, int] = {"train": 0, "val": 1, "test": 2, "all": -1}
 
         # Run evaluation across folds
-        all_results = []
-        all_auc = []
-        all_acc = []
-        all_detailed_metrics = []
+        all_results: List[Any] = []
+        all_auc: List[float] = []
+        all_acc: List[float] = []
+        all_detailed_metrics: List[Optional[Dict[str, Any]]] = []
 
-        for ckpt_idx in range(len(ckpt_paths)):
-            fold = config.folds[ckpt_idx]
-
+        for ckpt_idx, fold in enumerate(config.folds):
             # Get the appropriate dataset split
             if datasets_id[config.split] < 0:
-                split_dataset = dataset
+                split_dataset: Generic_MIL_Dataset = dataset
             else:
-                csv_path = "{}/splits_{}.csv".format(
-                    config.splits_dir, config.folds[ckpt_idx]
+                csv_path: str = f"{config.splits_dir}/splits_{fold}.csv"
+                datasets: List[Generic_MIL_Dataset] = dataset.return_splits(
+                    from_id=False, csv_path=csv_path
                 )
-                datasets = dataset.return_splits(from_id=False, csv_path=csv_path)
                 split_dataset = datasets[datasets_id[config.split]]
 
-            # Run evaluation (eval function is imported from eval_utils,
-            # and is assumed to handle nested MLflow logging for the fold)
+            # Run evaluation
             model, patient_results, test_error, auc, df, detailed_results = eval(
                 split_dataset, config, ckpt_paths[ckpt_idx], fold
             )
 
             all_results.append(patient_results)
             all_auc.append(auc)
-            all_acc.append(1 - test_error)
+            all_acc.append(1.0 - test_error)
 
             # Extract and store detailed metrics for aggregation
             if detailed_results and "detailed_metrics" in detailed_results:
                 all_detailed_metrics.append(detailed_results["detailed_metrics"])
+            else:
+                all_detailed_metrics.append(None)
 
             # Save individual fold results
-            fold_results_path = os.path.join(
-                config.save_dir, "fold_{}.csv".format(config.folds[ckpt_idx])
-            )
-            df.to_csv(
-                fold_results_path,
-                index=False,
-            )
+            fold_results_path: str = os.path.join(config.save_dir, f"fold_{fold}.csv")
+            df.to_csv(fold_results_path, index=False)
+
             # Log the individual fold CSV as an artifact in the *parent* run too
             mlflow.log_artifact(fold_results_path, artifact_path="fold_results")
 
-        # ====================================================================
         # MLFLOW INTEGRATION: Log the best model based on evaluation metrics
-        # ====================================================================
+        best_model: Optional[torch.nn.Module] = None
         if config.register_best_model:
             best_model = log_best_model_to_mlflow(
                 config,
@@ -478,70 +486,79 @@ def run_evaluation(config):
             )
 
         # Save summary
-        final_df = pd.DataFrame(
+        final_df: pd.DataFrame = pd.DataFrame(
             {"folds": config.folds, "test_auc": all_auc, "test_acc": all_acc}
         )
 
         if len(config.folds) != config.k:
-            save_name = "summary_partial_{}_{}.csv".format(
-                config.folds[0], config.folds[-1]
-            )
+            save_name: str = f"summary_partial_{config.folds[0]}_{config.folds[-1]}.csv"
         else:
-            save_name = "summary.csv"
+            save_name: str = "summary.csv"
 
-        final_summary_path = os.path.join(config.save_dir, save_name)
+        final_summary_path: str = os.path.join(config.save_dir, save_name)
         final_df.to_csv(final_summary_path)
 
-        # ====================================================================
         # MLFLOW INTEGRATION: Log final aggregate statistics and summary file
-        # ====================================================================
         mlflow.log_artifact(final_summary_path)
         mlflow.set_tag(
             "Evaluating Info", f"CLAM model evaluating with {config.data_set_name} data"
         )
 
         # Log aggregate metrics
-        mlflow.log_metric(f"Aggregate_{config.split}_AUC_Mean", np.mean(all_auc))
-        mlflow.log_metric(f"Aggregate_{config.split}_AUC_Std", np.std(all_auc))
-        mlflow.log_metric(f"Aggregate_{config.split}_Accuracy_Mean", np.mean(all_acc))
-        mlflow.log_metric(f"Aggregate_{config.split}_Accuracy_Std", np.std(all_acc))
+        mlflow.log_metric(f"Aggregate_{config.split}_AUC_Mean", float(np.mean(all_auc)))
+        mlflow.log_metric(f"Aggregate_{config.split}_AUC_Std", float(np.std(all_auc)))
+        mlflow.log_metric(
+            f"Aggregate_{config.split}_Accuracy_Mean", float(np.mean(all_acc))
+        )
+        mlflow.log_metric(
+            f"Aggregate_{config.split}_Accuracy_Std", float(np.std(all_acc))
+        )
 
         # Log detailed aggregate metrics if available
         if all_detailed_metrics and config.detailed_metrics:
             try:
                 # Calculate aggregate detailed metrics
-                all_precisions = [
-                    m.get("macro_avg_precision", 0) for m in all_detailed_metrics if m
+                all_precisions: List[float] = [
+                    m.get("macro_avg_precision", 0.0)
+                    for m in all_detailed_metrics
+                    if m is not None
                 ]
-                all_recalls = [
-                    m.get("macro_avg_recall", 0) for m in all_detailed_metrics if m
+                all_recalls: List[float] = [
+                    m.get("macro_avg_recall", 0.0)
+                    for m in all_detailed_metrics
+                    if m is not None
                 ]
-                all_f1_scores = [
-                    m.get("macro_avg_f1_score", 0) for m in all_detailed_metrics if m
+                all_f1_scores: List[float] = [
+                    m.get("macro_avg_f1_score", 0.0)
+                    for m in all_detailed_metrics
+                    if m is not None
                 ]
 
                 if all_precisions:
                     mlflow.log_metric(
                         f"Aggregate_{config.split}_Precision_Mean",
-                        np.mean(all_precisions),
+                        float(np.mean(all_precisions)),
                     )
                     mlflow.log_metric(
                         f"Aggregate_{config.split}_Precision_Std",
-                        np.std(all_precisions),
+                        float(np.std(all_precisions)),
                     )
                 if all_recalls:
                     mlflow.log_metric(
-                        f"Aggregate_{config.split}_Recall_Mean", np.mean(all_recalls)
+                        f"Aggregate_{config.split}_Recall_Mean",
+                        float(np.mean(all_recalls)),
                     )
                     mlflow.log_metric(
-                        f"Aggregate_{config.split}_Recall_Std", np.std(all_recalls)
+                        f"Aggregate_{config.split}_Recall_Std",
+                        float(np.std(all_recalls)),
                     )
                 if all_f1_scores:
                     mlflow.log_metric(
-                        f"Aggregate_{config.split}_F1_Mean", np.mean(all_f1_scores)
+                        f"Aggregate_{config.split}_F1_Mean",
+                        float(np.mean(all_f1_scores)),
                     )
                     mlflow.log_metric(
-                        f"Aggregate_{config.split}_F1_Std", np.std(all_f1_scores)
+                        f"Aggregate_{config.split}_F1_Std", float(np.std(all_f1_scores))
                     )
 
             except Exception as e:
@@ -556,8 +573,8 @@ def run_evaluation(config):
         }
 
 
-def create_parser():
-    """Create argument parser for evaluation"""
+def create_parser() -> argparse.ArgumentParser:
+    """Create argument parser for evaluation."""
     parser = argparse.ArgumentParser(description="CLAM Evaluation Script")
 
     # Data parameters
@@ -613,6 +630,7 @@ def create_parser():
     parser.add_argument(
         "--subtyping", action="store_true", default=False, help="subtyping problem"
     )
+
     # Evaluation parameters
     parser.add_argument(
         "--k", type=int, default=10, help="number of folds (default: 10)"
@@ -636,6 +654,7 @@ def create_parser():
     parser.add_argument(
         "--task", type=str, choices=["task_1_tumor_vs_normal", "task_2_tumor_subtyping"]
     )
+
     # MLflow model registration options
     parser.add_argument(
         "--registered_model_name",
@@ -659,20 +678,20 @@ def create_parser():
     return parser
 
 
-def main():
-    """Main function for command line execution"""
+def main() -> Dict[str, Any]:
+    """Main function for command line execution."""
     parser = create_parser()
     args = parser.parse_args()
 
     # Convert args to dictionary and create config
-    config_dict = vars(args)
+    config_dict: Dict[str, Any] = vars(args)
     config_dict["register_best_model"] = not args.no_register_model
     config_dict["detailed_metrics"] = not args.no_detailed_metrics
 
-    config = EvalConfig(**config_dict)
+    config: EvalConfig = EvalConfig(**config_dict)
 
     # Run evaluation
-    results = run_evaluation(config)
+    results: Dict[str, Any] = run_evaluation(config)
     print("Evaluation completed!")
 
     return results

@@ -50,14 +50,14 @@
             // --- Script Arguments ---
             "args": [
                 "--max_epochs",
-                "3",
+                "1",
                 "--drop_out",
                 "0.25",
                 "--early_stopping",
                 "--lr",
                 "2e-4",
                 "--k",
-                "2",
+                "1",
                 "--exp_code",
                 "task_1_tumor_vs_normal_resnet50",
                 "--weighted_sample",

@@ -1,28 +1,33 @@
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from models.model_mil import MIL_fc, MIL_fc_mc
 from models.model_clam import CLAM_SB, CLAM_MB
-import pdb
 import os
 import pandas as pd
 from utils.utils import *
 from utils.train_utils import AccuracyLogger
 from sklearn.metrics import roc_auc_score, roc_curve, auc
 from sklearn.preprocessing import label_binarize
-import matplotlib.pyplot as plt
 import mlflow
-from sklearn.metrics import precision_score, recall_score, f1_score, balanced_accuracy_score
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    balanced_accuracy_score,
+)
 import json
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List, Union
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def initiate_model(args, ckpt_path, device="cuda"):
+def initiate_model(
+    args: Any, ckpt_path: str, device: str = "cuda"
+) -> Union[CLAM_SB, CLAM_MB, MIL_fc, MIL_fc_mc]:
+    """Initialize model from checkpoint with proper configuration."""
     print("Init Model")
-    model_dict = {
+
+    model_dict: Dict[str, Any] = {
         "dropout": args.drop_out,
         "n_classes": args.n_classes,
         "embed_dim": args.embed_dim,
@@ -44,12 +49,14 @@ def initiate_model(args, ckpt_path, device="cuda"):
     # NOTE: print_network is assumed to be defined in utils.utils
     # print_network(model)
 
-    ckpt = torch.load(ckpt_path)
-    ckpt_clean = {}
+    ckpt: Dict[str, Any] = torch.load(ckpt_path)
+    ckpt_clean: Dict[str, Any] = {}
+
     for key in ckpt.keys():
         if "instance_loss_fn" in key:
             continue
         ckpt_clean.update({key.replace(".module", ""): ckpt[key]})
+
     model.load_state_dict(ckpt_clean, strict=True)
 
     _ = model.to(device)
@@ -57,66 +64,106 @@ def initiate_model(args, ckpt_path, device="cuda"):
     return model
 
 
-def calculate_detailed_metrics(all_labels: np.ndarray, all_preds: np.ndarray, all_probs: np.ndarray, n_classes: int) -> Dict[str, Any]:
-    """Calculate comprehensive evaluation metrics"""
-    metrics = {}
-    
+def calculate_detailed_metrics(
+    all_labels: np.ndarray, all_preds: np.ndarray, all_probs: np.ndarray, n_classes: int
+) -> Dict[str, Any]:
+    """Calculate comprehensive evaluation metrics."""
+    metrics: Dict[str, Any] = {}
+
     try:
         # Basic metrics
-        metrics['accuracy'] = float(np.mean(all_preds == all_labels))
-        metrics['balanced_accuracy'] = float(balanced_accuracy_score(all_labels, all_preds))
-        
+        metrics["accuracy"] = float(np.mean(all_preds == all_labels))
+        metrics["balanced_accuracy"] = float(
+            balanced_accuracy_score(all_labels, all_preds)
+        )
+
         # Precision, Recall, F1
-        metrics['precision_macro'] = float(precision_score(all_labels, all_preds, average='macro', zero_division=0))
-        metrics['recall_macro'] = float(recall_score(all_labels, all_preds, average='macro', zero_division=0))
-        metrics['f1_macro'] = float(f1_score(all_labels, all_preds, average='macro', zero_division=0))
-        
-        metrics['precision_weighted'] = float(precision_score(all_labels, all_preds, average='weighted', zero_division=0))
-        metrics['recall_weighted'] = float(recall_score(all_labels, all_preds, average='weighted', zero_division=0))
-        metrics['f1_weighted'] = float(f1_score(all_labels, all_preds, average='weighted', zero_division=0))
-        
+        metrics["precision_macro"] = float(
+            precision_score(all_labels, all_preds, average="macro", zero_division=0)
+        )
+        metrics["recall_macro"] = float(
+            recall_score(all_labels, all_preds, average="macro", zero_division=0)
+        )
+        metrics["f1_macro"] = float(
+            f1_score(all_labels, all_preds, average="macro", zero_division=0)
+        )
+
+        metrics["precision_weighted"] = float(
+            precision_score(all_labels, all_preds, average="weighted", zero_division=0)
+        )
+        metrics["recall_weighted"] = float(
+            recall_score(all_labels, all_preds, average="weighted", zero_division=0)
+        )
+        metrics["f1_weighted"] = float(
+            f1_score(all_labels, all_preds, average="weighted", zero_division=0)
+        )
+
         # Per-class metrics
         for class_idx in range(n_classes):
-            class_mask = (all_labels == class_idx)
+            class_mask: np.ndarray = all_labels == class_idx
             if np.sum(class_mask) > 0:
-                class_accuracy = float(np.mean(all_preds[class_mask] == class_idx))
-                metrics[f'class_{class_idx}_accuracy'] = class_accuracy
-                
-                # For binary classification, we can calculate class-specific precision/recall
+                class_accuracy: float = float(
+                    np.mean(all_preds[class_mask] == class_idx)
+                )
+                metrics[f"class_{class_idx}_accuracy"] = class_accuracy
+
+                # For binary classification, calculate class-specific precision/recall
                 if n_classes == 2:
-                    binary_preds = (all_preds == class_idx).astype(int)
-                    binary_labels = (all_labels == class_idx).astype(int)
+                    binary_preds: np.ndarray = (all_preds == class_idx).astype(int)
+                    binary_labels: np.ndarray = (all_labels == class_idx).astype(int)
                     if len(np.unique(binary_labels)) > 1:
-                        metrics[f'class_{class_idx}_precision'] = float(precision_score(binary_labels, binary_preds, zero_division=0))
-                        metrics[f'class_{class_idx}_recall'] = float(recall_score(binary_labels, binary_preds, zero_division=0))
-                        metrics[f'class_{class_idx}_f1'] = float(f1_score(binary_labels, binary_preds, zero_division=0))
-        
+                        metrics[f"class_{class_idx}_precision"] = float(
+                            precision_score(
+                                binary_labels, binary_preds, zero_division=0
+                            )
+                        )
+                        metrics[f"class_{class_idx}_recall"] = float(
+                            recall_score(binary_labels, binary_preds, zero_division=0)
+                        )
+                        metrics[f"class_{class_idx}_f1"] = float(
+                            f1_score(binary_labels, binary_preds, zero_division=0)
+                        )
+
         # Confidence metrics
-        max_probs = np.max(all_probs, axis=1)
-        metrics['mean_confidence'] = float(np.mean(max_probs))
-        metrics['confidence_std'] = float(np.std(max_probs))
-        
+        max_probs: np.ndarray = np.max(all_probs, axis=1)
+        metrics["mean_confidence"] = float(np.mean(max_probs))
+        metrics["confidence_std"] = float(np.std(max_probs))
+
         # Calibration metrics (simple version)
-        correct_predictions = (all_preds == all_labels)
-        metrics['avg_confidence_correct'] = float(np.mean(max_probs[correct_predictions])) if np.sum(correct_predictions) > 0 else 0.0
-        metrics['avg_confidence_incorrect'] = float(np.mean(max_probs[~correct_predictions])) if np.sum(~correct_predictions) > 0 else 0.0
-        
+        correct_predictions: np.ndarray = all_preds == all_labels
+        metrics["avg_confidence_correct"] = (
+            float(np.mean(max_probs[correct_predictions]))
+            if np.sum(correct_predictions) > 0
+            else 0.0
+        )
+        metrics["avg_confidence_incorrect"] = (
+            float(np.mean(max_probs[~correct_predictions]))
+            if np.sum(~correct_predictions) > 0
+            else 0.0
+        )
+
     except Exception as e:
         print(f"Warning: Error calculating detailed metrics: {e}")
-    
+
     return metrics
 
 
-def eval(dataset, args, ckpt_path, fold: Optional[int] = None):
+def eval(dataset: Any, args: Any, ckpt_path: str, fold: Optional[int] = None) -> Tuple[
+    Union[CLAM_SB, CLAM_MB, MIL_fc, MIL_fc_mc],  # model
+    Dict[str, Any],  # patient_results
+    float,  # test_error
+    float,  # auc_score
+    pd.DataFrame,  # df
+    Optional[Dict[str, Any]],  # detailed_results
+]:
     """
     Evaluates the model and logs final results to MLflow with detailed metrics.
     """
     # MLflow nested run for evaluation
-    fold_suffix = f"_fold_{fold}" if fold is not None else ""
-    eval_run_name = f"Evaluation{fold_suffix}: {os.path.basename(ckpt_path)}"
-    
-    with mlflow.start_run(run_name=eval_run_name, nested=True) as run:
+    fold_suffix: str = f"_fold_{fold}" if fold is not None else ""
+    eval_run_name: str = f"Evaluation{fold_suffix}: {os.path.basename(ckpt_path)}"
 
+    with mlflow.start_run(run_name=eval_run_name, nested=True) as run:
         # Log essential parameters and the model checkpoint path
         mlflow.log_param("eval_ckpt_path", ckpt_path)
         mlflow.log_param("model_type", args.model_type)
@@ -125,18 +172,20 @@ def eval(dataset, args, ckpt_path, fold: Optional[int] = None):
             mlflow.log_param("fold", fold)
 
         # Initiate model and run summary
-        model = initiate_model(args, ckpt_path)
+        model: Union[CLAM_SB, CLAM_MB, MIL_fc, MIL_fc_mc] = initiate_model(
+            args, ckpt_path
+        )
 
         print("Init Loaders")
         # NOTE: get_simple_loader is assumed to be defined in utils.utils
-        loader = get_simple_loader(dataset)
-        patient_results, test_error, auc_score, df, acc_logger, detailed_results = summary(
-            model, loader, args
+        loader: Any = get_simple_loader(dataset)
+        patient_results, test_error, auc_score, df, acc_logger, detailed_results = (
+            summary(model, loader, args)
         )
 
-        test_acc = 1.0 - test_error  # Calculate test accuracy
+        test_acc: float = 1.0 - test_error  # Calculate test accuracy
 
-        # 3. Log basic metrics to MLflow
+        # Log basic metrics to MLflow
         mlflow.log_metric("test_error", test_error)
         mlflow.log_metric("test_accuracy", test_acc)
         mlflow.log_metric("test_auc", auc_score)
@@ -149,81 +198,99 @@ def eval(dataset, args, ckpt_path, fold: Optional[int] = None):
                 mlflow.log_metric(f"test_class_{i}_correct", correct)
                 mlflow.log_metric(f"test_class_{i}_total", count)
 
-        # 4. Log detailed metrics if available
+        # Log detailed metrics if available
         if detailed_results and args.detailed_metrics:
             try:
                 # Log comprehensive metrics
-                detailed_metrics = detailed_results.get('detailed_metrics', {})
+                detailed_metrics: Dict[str, Any] = detailed_results.get(
+                    "detailed_metrics", {}
+                )
                 for metric_name, metric_value in detailed_metrics.items():
                     if isinstance(metric_value, (int, float)):
                         mlflow.log_metric(f"test_{metric_name}", metric_value)
-                
+
                 # Log per-class detailed metrics
                 for class_idx in range(args.n_classes):
-                    for metric_type in ['precision', 'recall', 'f1']:
-                        metric_key = f'class_{class_idx}_{metric_type}'
+                    for metric_type in ["precision", "recall", "f1"]:
+                        metric_key: str = f"class_{class_idx}_{metric_type}"
                         if metric_key in detailed_metrics:
-                            mlflow.log_metric(f"test_{metric_key}", detailed_metrics[metric_key])
-                
+                            mlflow.log_metric(
+                                f"test_{metric_key}", detailed_metrics[metric_key]
+                            )
+
                 # Log confidence metrics
-                confidence_metrics = ['mean_confidence', 'confidence_std', 
-                                    'avg_confidence_correct', 'avg_confidence_incorrect']
+                confidence_metrics: List[str] = [
+                    "mean_confidence",
+                    "confidence_std",
+                    "avg_confidence_correct",
+                    "avg_confidence_incorrect",
+                ]
                 for metric in confidence_metrics:
                     if metric in detailed_metrics:
                         mlflow.log_metric(f"test_{metric}", detailed_metrics[metric])
-                        
+
             except Exception as e:
                 print(f"Warning: Could not log detailed metrics: {e}")
 
-        # 5. Log artifacts
+        # Log artifacts
         # Log the results DataFrame (predictions, probabilities) as a CSV artifact
-        results_path = os.path.join(
+        results_path: str = os.path.join(
             os.path.dirname(ckpt_path), f"{eval_run_name}_results.csv"
         )
         df.to_csv(results_path, index=False)
         mlflow.log_artifact(results_path)
 
         # Log detailed metrics JSON if available
-        if detailed_results and 'metrics_json_path' in detailed_results:
-            mlflow.log_artifact(detailed_results['metrics_json_path'])
-        
+        if detailed_results and "metrics_json_path" in detailed_results:
+            mlflow.log_artifact(detailed_results["metrics_json_path"])
+
         # Log visualization artifacts if available
-        if detailed_results and 'artifacts' in detailed_results:
-            for artifact_name, artifact_path in detailed_results['artifacts'].items():
+        if detailed_results and "artifacts" in detailed_results:
+            for artifact_name, artifact_path in detailed_results["artifacts"].items():
                 if os.path.exists(artifact_path):
                     mlflow.log_artifact(artifact_path, artifact_path="evaluation_plots")
 
-        print("test_error: ", test_error)
-        print("auc: ", auc_score)
+        print(f"test_error: {test_error}")
+        print(f"auc: {auc_score}")
 
     return model, patient_results, test_error, auc_score, df, detailed_results
 
 
-def summary(model, loader, args):
-    acc_logger = AccuracyLogger(n_classes=args.n_classes)
+def summary(
+    model: Union[CLAM_SB, CLAM_MB, MIL_fc, MIL_fc_mc], loader: Any, args: Any
+) -> Tuple[
+    Dict[str, Any],  # patient_results
+    float,  # test_error
+    float,  # auc_score
+    pd.DataFrame,  # df
+    AccuracyLogger,  # acc_logger
+    Optional[Dict[str, Any]],  # detailed_results
+]:
+    """Run model inference on loader and compute comprehensive evaluation metrics."""
+    acc_logger: AccuracyLogger = AccuracyLogger(n_classes=args.n_classes)
     model.eval()
-    test_loss = 0.0
-    test_error = 0.0
+    test_loss: float = 0.0
+    test_error: float = 0.0
 
-    all_probs = np.zeros((len(loader), args.n_classes))
-    all_labels = np.zeros(len(loader))
-    all_preds = np.zeros(len(loader))
+    all_probs: np.ndarray = np.zeros((len(loader), args.n_classes))
+    all_labels: np.ndarray = np.zeros(len(loader))
+    all_preds: np.ndarray = np.zeros(len(loader))
 
-    slide_ids = loader.dataset.slide_data["slide_id"]
-    patient_results = {}
+    slide_ids: pd.Series = loader.dataset.slide_data["slide_id"]
+    patient_results: Dict[str, Any] = {}
 
     # NOTE: device is assumed to be defined globally as 'cuda' or 'cpu'
     with torch.no_grad():
         for batch_idx, (data, label) in enumerate(loader):
             data, label = data.to(device), label.to(device)
-            slide_id = slide_ids.iloc[batch_idx]
+            slide_id: str = slide_ids.iloc[batch_idx]
 
             # NOTE: model returns logits, Y_prob, Y_hat, _, results_dict
             logits, Y_prob, Y_hat, _, results_dict = model(data)
 
             acc_logger.log(Y_hat, label)
 
-            probs = Y_prob.cpu().numpy()
+            probs: np.ndarray = Y_prob.cpu().numpy()
 
             all_probs[batch_idx] = probs
             all_labels[batch_idx] = label.item()
@@ -240,20 +307,22 @@ def summary(model, loader, args):
             )
 
             # NOTE: calculate_error is assumed to be defined in utils.utils
-            error = calculate_error(Y_hat, label)
+            error: float = calculate_error(Y_hat, label)
             test_error += error
 
     del data
     test_error /= len(loader)
 
-    aucs = []
+    aucs: List[float] = []
+    auc_score: float
+
     if len(np.unique(all_labels)) == 1:
-        auc_score = -1
+        auc_score = -1.0
     else:
         if args.n_classes == 2:
             auc_score = roc_auc_score(all_labels, all_probs[:, 1])
         else:
-            binary_labels = label_binarize(
+            binary_labels: np.ndarray = label_binarize(
                 all_labels, classes=[i for i in range(args.n_classes)]
             )
             for class_idx in range(args.n_classes):
@@ -275,43 +344,53 @@ def summary(model, loader, args):
                 auc_score = np.nanmean(np.array(aucs))
 
     # Calculate detailed metrics if enabled
-    detailed_results = None
+    detailed_results: Optional[Dict[str, Any]] = None
     if args.detailed_metrics:
         try:
             from eval import create_detailed_metrics_artifacts
-            
+
             # Get fold from args if available
-            fold = getattr(args, 'fold', None)
+            fold: Optional[int] = getattr(args, "fold", None)
             if fold is None:
                 fold = 0  # Default fold value
-                
+
             detailed_metrics, artifacts = create_detailed_metrics_artifacts(
                 all_labels, all_preds, all_probs, args, fold
             )
-            
+
             # Calculate additional comprehensive metrics
-            comprehensive_metrics = calculate_detailed_metrics(all_labels, all_preds, all_probs, args.n_classes)
+            comprehensive_metrics: Dict[str, Any] = calculate_detailed_metrics(
+                all_labels, all_preds, all_probs, args.n_classes
+            )
             detailed_metrics.update(comprehensive_metrics)
-            
+
             # Save comprehensive metrics as JSON
-            metrics_json_path = os.path.join(args.save_dir, f"comprehensive_metrics_fold_{fold}.json")
-            with open(metrics_json_path, 'w') as f:
+            metrics_json_path: str = os.path.join(
+                args.save_dir, f"comprehensive_metrics_fold_{fold}.json"
+            )
+            with open(metrics_json_path, "w") as f:
                 json.dump(detailed_metrics, f, indent=2)
             artifacts["comprehensive_metrics"] = metrics_json_path
-            
+
             detailed_results = {
-                'detailed_metrics': detailed_metrics,
-                'artifacts': artifacts,
-                'metrics_json_path': metrics_json_path
+                "detailed_metrics": detailed_metrics,
+                "artifacts": artifacts,
+                "metrics_json_path": metrics_json_path,
             }
-            
+
         except Exception as e:
             print(f"Warning: Could not generate detailed metrics: {e}")
             detailed_results = None
 
-    results_dict = {"slide_id": slide_ids, "Y": all_labels, "Y_hat": all_preds}
+    # Create results DataFrame
+    results_dict: Dict[str, Any] = {
+        "slide_id": slide_ids,
+        "Y": all_labels,
+        "Y_hat": all_preds,
+    }
     for c in range(args.n_classes):
-        results_dict.update({"p_{}".format(c): all_probs[:, c]})
-    df = pd.DataFrame(results_dict)
-    
+        results_dict.update({f"p_{c}": all_probs[:, c]})
+
+    df: pd.DataFrame = pd.DataFrame(results_dict)
+
     return patient_results, test_error, auc_score, df, acc_logger, detailed_results

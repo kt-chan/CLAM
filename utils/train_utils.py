@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional, Tuple, TypedDict, Union
+from typing import Any, Dict, Optional, Tuple, TypedDict
 
 import mlflow
 import numpy as np
@@ -13,7 +13,7 @@ from models.model_mil import MIL_fc, MIL_fc_mc
 from sklearn.metrics import auc as calc_auc
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.preprocessing import label_binarize
-from utils.utils import calculate_error, get_optim, get_split_loader, seed_torch
+from utils.utils import calculate_error, get_optim, get_split_loader
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
