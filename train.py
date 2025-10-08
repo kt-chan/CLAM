@@ -322,10 +322,7 @@ def log_best_model_to_mlflow(
     try:
         # Define explicit requirements
         pip_reqs = [
-            "timm==0.9.8",
-            "torch==2.8.0+cu128",
-            "torchvision==0.23.0+cu128",
-            "torchaudio==2.8.0+cu128",
+            f"torch=={torch.__version__}",
             f"mlflow=={mlflow.__version__}",
             "numpy",
             "pandas",

@@ -1,7 +1,6 @@
-## eval.py
-
 from __future__ import print_function
-from typing import List, Optional
+from typing import Optional, Dict, List, Any, Tuple
+import json
 
 import numpy as np
 import argparse
@@ -23,6 +22,8 @@ import h5py
 from utils.eval_utils import *
 import mlflow
 from mlflow.models.signature import infer_signature
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
 
 
 class EvalConfig:
@@ -58,6 +59,7 @@ class EvalConfig:
         # MLflow model registration parameters
         self.registered_model_name: Optional[str] = kwargs.get("registered_model_name")
         self.register_best_model: bool = kwargs.get("register_best_model", True)
+        self.detailed_metrics: bool = kwargs.get("detailed_metrics", True)
 
         # Derived attributes
         self._setup_derived_attributes()
@@ -76,12 +78,12 @@ class EvalConfig:
         self.save_dir = os.path.join(
             "./eval_results", "EVAL_" + str(self.save_exp_code)
         )
-        # NOTE: Assumes models_exp_code is in the format EXP_CODE_sSEED, matching the training results dir
+
         self.models_dir = os.path.join(self.results_dir, str(self.models_exp_code))
 
         # Setup default registered model name
         if self.registered_model_name is None and self.models_exp_code:
-            self.registered_model_name = f"eval_{self.model_type}_{self.models_exp_code}"
+            self.registered_model_name = f"{self.model_type}_{self.models_exp_code}"
 
         os.makedirs(self.save_dir, exist_ok=True)
 
@@ -126,6 +128,7 @@ class EvalConfig:
             "drop_out": self.drop_out,
             "model_size": self.model_size,
             "k_folds_evaluated": list(self.folds),
+            "detailed_metrics": self.detailed_metrics,
         }
 
 
@@ -159,10 +162,114 @@ def setup_eval_dataset(config):
     return dataset
 
 
+def create_detailed_metrics_artifacts(
+    all_labels: np.ndarray,
+    all_preds: np.ndarray,
+    all_probs: np.ndarray,
+    config,
+    fold: int,
+) -> Dict[str, Any]:
+    """
+    Create detailed evaluation metrics and artifacts for MLflow logging
+    """
+    metrics_dict = {}
+    artifacts = {}
+
+    try:
+        # Classification report
+        class_report = classification_report(
+            all_labels, all_preds, output_dict=True, zero_division=0
+        )
+        metrics_dict["classification_report"] = class_report
+
+        # Log per-class metrics
+        for class_idx in range(config.n_classes):
+            if str(class_idx) in class_report:
+                metrics_dict[f"class_{class_idx}_precision"] = class_report[
+                    str(class_idx)
+                ]["precision"]
+                metrics_dict[f"class_{class_idx}_recall"] = class_report[
+                    str(class_idx)
+                ]["recall"]
+                metrics_dict[f"class_{class_idx}_f1_score"] = class_report[
+                    str(class_idx)
+                ]["f1-score"]
+                metrics_dict[f"class_{class_idx}_support"] = class_report[
+                    str(class_idx)
+                ]["support"]
+
+        # Overall metrics
+        metrics_dict["overall_accuracy"] = class_report["accuracy"]
+        metrics_dict["macro_avg_precision"] = class_report["macro avg"]["precision"]
+        metrics_dict["macro_avg_recall"] = class_report["macro avg"]["recall"]
+        metrics_dict["macro_avg_f1_score"] = class_report["macro avg"]["f1-score"]
+        metrics_dict["weighted_avg_precision"] = class_report["weighted avg"][
+            "precision"
+        ]
+        metrics_dict["weighted_avg_recall"] = class_report["weighted avg"]["recall"]
+        metrics_dict["weighted_avg_f1_score"] = class_report["weighted avg"]["f1-score"]
+
+        # Confusion matrix
+        cm = confusion_matrix(all_labels, all_preds)
+        metrics_dict["confusion_matrix"] = cm.tolist()
+
+        # Create confusion matrix plot
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+        plt.title(f"Confusion Matrix - Fold {fold}")
+        plt.ylabel("True Label")
+        plt.xlabel("Predicted Label")
+        cm_path = os.path.join(config.save_dir, f"confusion_matrix_fold_{fold}.png")
+        plt.savefig(cm_path, bbox_inches="tight", dpi=300)
+        plt.close()
+        artifacts["confusion_matrix"] = cm_path
+
+        # ROC curve data for binary classification
+        if config.n_classes == 2:
+            from sklearn.metrics import roc_curve
+
+            fpr, tpr, thresholds = roc_curve(all_labels, all_probs[:, 1])
+            roc_data = {
+                "fpr": fpr.tolist(),
+                "tpr": tpr.tolist(),
+                "thresholds": thresholds.tolist(),
+            }
+            metrics_dict["roc_curve"] = roc_data
+
+            # Create ROC curve plot
+            plt.figure(figsize=(8, 6))
+            plt.plot(fpr, tpr, color="darkorange", lw=2, label="ROC curve")
+            plt.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.0, 1.05])
+            plt.xlabel("False Positive Rate")
+            plt.ylabel("True Positive Rate")
+            plt.title(f"ROC Curve - Fold {fold}")
+            plt.legend(loc="lower right")
+            roc_path = os.path.join(config.save_dir, f"roc_curve_fold_{fold}.png")
+            plt.savefig(roc_path, bbox_inches="tight", dpi=300)
+            plt.close()
+            artifacts["roc_curve"] = roc_path
+
+        # Save detailed metrics as JSON
+        metrics_json_path = os.path.join(
+            config.save_dir, f"detailed_metrics_fold_{fold}.json"
+        )
+        with open(metrics_json_path, "w") as f:
+            json.dump(metrics_dict, f, indent=2)
+        artifacts["detailed_metrics"] = metrics_json_path
+
+    except Exception as e:
+        print(f"Warning: Could not create detailed metrics for fold {fold}: {e}")
+
+    return metrics_dict, artifacts
+
+
 def log_best_model_to_mlflow(
     config,
     all_auc: List[float],
     all_acc: List[float],
+    all_detailed_metrics: List[Dict],
     folds: List[int],
     ckpt_paths: List[str],
 ):
@@ -186,7 +293,9 @@ def log_best_model_to_mlflow(
     best_model_checkpoint_path = ckpt_paths[best_fold_idx]
 
     if not os.path.exists(best_model_checkpoint_path):
-        print(f"Warning: Best model checkpoint not found at {best_model_checkpoint_path}")
+        print(
+            f"Warning: Best model checkpoint not found at {best_model_checkpoint_path}"
+        )
         return None
 
     try:
@@ -238,6 +347,23 @@ def log_best_model_to_mlflow(
         mlflow.set_tag("best_model_source", "evaluation")
         mlflow.log_metric(f"best_{config.split}_auc", best_auc)
         mlflow.log_metric(f"best_{config.split}_accuracy", best_acc)
+
+        # Log detailed metrics for the best model if available
+        if all_detailed_metrics and best_fold_idx < len(all_detailed_metrics):
+            best_detailed_metrics = all_detailed_metrics[best_fold_idx]
+            if best_detailed_metrics:
+                mlflow.log_metric(
+                    f"best_{config.split}_precision",
+                    best_detailed_metrics.get("macro_avg_precision", 0),
+                )
+                mlflow.log_metric(
+                    f"best_{config.split}_recall",
+                    best_detailed_metrics.get("macro_avg_recall", 0),
+                )
+                mlflow.log_metric(
+                    f"best_{config.split}_f1_score",
+                    best_detailed_metrics.get("macro_avg_f1_score", 0),
+                )
 
         return best_model
 
@@ -298,6 +424,7 @@ def run_evaluation(config):
         all_results = []
         all_auc = []
         all_acc = []
+        all_detailed_metrics = []
 
         for ckpt_idx in range(len(ckpt_paths)):
             fold = config.folds[ckpt_idx]
@@ -314,13 +441,17 @@ def run_evaluation(config):
 
             # Run evaluation (eval function is imported from eval_utils,
             # and is assumed to handle nested MLflow logging for the fold)
-            model, patient_results, test_error, auc, df = eval(
-                split_dataset, config, ckpt_paths[ckpt_idx]
+            model, patient_results, test_error, auc, df, detailed_results = eval(
+                split_dataset, config, ckpt_paths[ckpt_idx], fold
             )
 
             all_results.append(patient_results)
             all_auc.append(auc)
             all_acc.append(1 - test_error)
+
+            # Extract and store detailed metrics for aggregation
+            if detailed_results and "detailed_metrics" in detailed_results:
+                all_detailed_metrics.append(detailed_results["detailed_metrics"])
 
             # Save individual fold results
             fold_results_path = os.path.join(
@@ -338,7 +469,12 @@ def run_evaluation(config):
         # ====================================================================
         if config.register_best_model:
             best_model = log_best_model_to_mlflow(
-                config, all_auc, all_acc, list(config.folds), ckpt_paths
+                config,
+                all_auc,
+                all_acc,
+                all_detailed_metrics,
+                list(config.folds),
+                ckpt_paths,
             )
 
         # Save summary
@@ -363,15 +499,59 @@ def run_evaluation(config):
         mlflow.set_tag(
             "Evaluating Info", f"CLAM model evaluating with {config.data_set_name} data"
         )
+
+        # Log aggregate metrics
         mlflow.log_metric(f"Aggregate_{config.split}_AUC_Mean", np.mean(all_auc))
         mlflow.log_metric(f"Aggregate_{config.split}_AUC_Std", np.std(all_auc))
         mlflow.log_metric(f"Aggregate_{config.split}_Accuracy_Mean", np.mean(all_acc))
         mlflow.log_metric(f"Aggregate_{config.split}_Accuracy_Std", np.std(all_acc))
 
+        # Log detailed aggregate metrics if available
+        if all_detailed_metrics and config.detailed_metrics:
+            try:
+                # Calculate aggregate detailed metrics
+                all_precisions = [
+                    m.get("macro_avg_precision", 0) for m in all_detailed_metrics if m
+                ]
+                all_recalls = [
+                    m.get("macro_avg_recall", 0) for m in all_detailed_metrics if m
+                ]
+                all_f1_scores = [
+                    m.get("macro_avg_f1_score", 0) for m in all_detailed_metrics if m
+                ]
+
+                if all_precisions:
+                    mlflow.log_metric(
+                        f"Aggregate_{config.split}_Precision_Mean",
+                        np.mean(all_precisions),
+                    )
+                    mlflow.log_metric(
+                        f"Aggregate_{config.split}_Precision_Std",
+                        np.std(all_precisions),
+                    )
+                if all_recalls:
+                    mlflow.log_metric(
+                        f"Aggregate_{config.split}_Recall_Mean", np.mean(all_recalls)
+                    )
+                    mlflow.log_metric(
+                        f"Aggregate_{config.split}_Recall_Std", np.std(all_recalls)
+                    )
+                if all_f1_scores:
+                    mlflow.log_metric(
+                        f"Aggregate_{config.split}_F1_Mean", np.mean(all_f1_scores)
+                    )
+                    mlflow.log_metric(
+                        f"Aggregate_{config.split}_F1_Std", np.std(all_f1_scores)
+                    )
+
+            except Exception as e:
+                print(f"Warning: Could not log aggregate detailed metrics: {e}")
+
         return {
             "all_results": all_results,
             "all_auc": all_auc,
             "all_acc": all_acc,
+            "all_detailed_metrics": all_detailed_metrics,
             "final_df": final_df,
         }
 
@@ -469,6 +649,12 @@ def create_parser():
         default=False,
         help="Disable model registration in MLflow",
     )
+    parser.add_argument(
+        "--no_detailed_metrics",
+        action="store_true",
+        default=False,
+        help="Disable detailed metrics calculation and logging",
+    )
 
     return parser
 
@@ -481,6 +667,7 @@ def main():
     # Convert args to dictionary and create config
     config_dict = vars(args)
     config_dict["register_best_model"] = not args.no_register_model
+    config_dict["detailed_metrics"] = not args.no_detailed_metrics
 
     config = EvalConfig(**config_dict)
 

@@ -1,5 +1,4 @@
 import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,7 +12,10 @@ from utils.train_utils import AccuracyLogger
 from sklearn.metrics import roc_auc_score, roc_curve, auc
 from sklearn.preprocessing import label_binarize
 import matplotlib.pyplot as plt
-import mlflow  # <-- ADDED MLflow import
+import mlflow
+from sklearn.metrics import precision_score, recall_score, f1_score, balanced_accuracy_score
+import json
+from typing import Dict, Any, Tuple, Optional
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -55,58 +57,146 @@ def initiate_model(args, ckpt_path, device="cuda"):
     return model
 
 
-def eval(dataset, args, ckpt_path):
+def calculate_detailed_metrics(all_labels: np.ndarray, all_preds: np.ndarray, all_probs: np.ndarray, n_classes: int) -> Dict[str, Any]:
+    """Calculate comprehensive evaluation metrics"""
+    metrics = {}
+    
+    try:
+        # Basic metrics
+        metrics['accuracy'] = float(np.mean(all_preds == all_labels))
+        metrics['balanced_accuracy'] = float(balanced_accuracy_score(all_labels, all_preds))
+        
+        # Precision, Recall, F1
+        metrics['precision_macro'] = float(precision_score(all_labels, all_preds, average='macro', zero_division=0))
+        metrics['recall_macro'] = float(recall_score(all_labels, all_preds, average='macro', zero_division=0))
+        metrics['f1_macro'] = float(f1_score(all_labels, all_preds, average='macro', zero_division=0))
+        
+        metrics['precision_weighted'] = float(precision_score(all_labels, all_preds, average='weighted', zero_division=0))
+        metrics['recall_weighted'] = float(recall_score(all_labels, all_preds, average='weighted', zero_division=0))
+        metrics['f1_weighted'] = float(f1_score(all_labels, all_preds, average='weighted', zero_division=0))
+        
+        # Per-class metrics
+        for class_idx in range(n_classes):
+            class_mask = (all_labels == class_idx)
+            if np.sum(class_mask) > 0:
+                class_accuracy = float(np.mean(all_preds[class_mask] == class_idx))
+                metrics[f'class_{class_idx}_accuracy'] = class_accuracy
+                
+                # For binary classification, we can calculate class-specific precision/recall
+                if n_classes == 2:
+                    binary_preds = (all_preds == class_idx).astype(int)
+                    binary_labels = (all_labels == class_idx).astype(int)
+                    if len(np.unique(binary_labels)) > 1:
+                        metrics[f'class_{class_idx}_precision'] = float(precision_score(binary_labels, binary_preds, zero_division=0))
+                        metrics[f'class_{class_idx}_recall'] = float(recall_score(binary_labels, binary_preds, zero_division=0))
+                        metrics[f'class_{class_idx}_f1'] = float(f1_score(binary_labels, binary_preds, zero_division=0))
+        
+        # Confidence metrics
+        max_probs = np.max(all_probs, axis=1)
+        metrics['mean_confidence'] = float(np.mean(max_probs))
+        metrics['confidence_std'] = float(np.std(max_probs))
+        
+        # Calibration metrics (simple version)
+        correct_predictions = (all_preds == all_labels)
+        metrics['avg_confidence_correct'] = float(np.mean(max_probs[correct_predictions])) if np.sum(correct_predictions) > 0 else 0.0
+        metrics['avg_confidence_incorrect'] = float(np.mean(max_probs[~correct_predictions])) if np.sum(~correct_predictions) > 0 else 0.0
+        
+    except Exception as e:
+        print(f"Warning: Error calculating detailed metrics: {e}")
+    
+    return metrics
+
+
+def eval(dataset, args, ckpt_path, fold: Optional[int] = None):
     """
-    Evaluates the model and logs final results to MLflow.
+    Evaluates the model and logs final results to MLflow with detailed metrics.
     """
-    # ====================================================================
-    # MLFLOW INTEGRATION: Start a new MLflow run for the evaluation/testing phase
-    # This run is separate from the training runs, or could be a nested run
-    # if called from a primary experiment run.
-    # We use a unique run name based on the checkpoint path.
-    # ====================================================================
-    eval_run_name = f"Evaluation: {os.path.basename(ckpt_path)}"
+    # MLflow nested run for evaluation
+    fold_suffix = f"_fold_{fold}" if fold is not None else ""
+    eval_run_name = f"Evaluation{fold_suffix}: {os.path.basename(ckpt_path)}"
+    
     with mlflow.start_run(run_name=eval_run_name, nested=True) as run:
 
-        # 1. Log essential parameters and the model checkpoint path
+        # Log essential parameters and the model checkpoint path
         mlflow.log_param("eval_ckpt_path", ckpt_path)
         mlflow.log_param("model_type", args.model_type)
         mlflow.log_param("n_classes", args.n_classes)
+        if fold is not None:
+            mlflow.log_param("fold", fold)
 
-        # 2. Initiate model and run summary
+        # Initiate model and run summary
         model = initiate_model(args, ckpt_path)
 
         print("Init Loaders")
         # NOTE: get_simple_loader is assumed to be defined in utils.utils
         loader = get_simple_loader(dataset)
-        patient_results, test_error, auc_score, df, acc_logger = summary(
+        patient_results, test_error, auc_score, df, acc_logger, detailed_results = summary(
             model, loader, args
         )
 
         test_acc = 1.0 - test_error  # Calculate test accuracy
 
-        # 3. Log final metrics to MLflow
+        # 3. Log basic metrics to MLflow
         mlflow.log_metric("test_error", test_error)
         mlflow.log_metric("test_accuracy", test_acc)
         mlflow.log_metric("test_auc", auc_score)
 
         # Log class-wise accuracy
         for i in range(args.n_classes):
-            acc, _, _ = acc_logger.get_summary(i)
+            acc, correct, count = acc_logger.get_summary(i)
             if acc is not None:
                 mlflow.log_metric(f"test_class_{i}_acc", acc)
+                mlflow.log_metric(f"test_class_{i}_correct", correct)
+                mlflow.log_metric(f"test_class_{i}_total", count)
 
-        # 4. Log the results DataFrame (predictions, probabilities) as a CSV artifact
+        # 4. Log detailed metrics if available
+        if detailed_results and args.detailed_metrics:
+            try:
+                # Log comprehensive metrics
+                detailed_metrics = detailed_results.get('detailed_metrics', {})
+                for metric_name, metric_value in detailed_metrics.items():
+                    if isinstance(metric_value, (int, float)):
+                        mlflow.log_metric(f"test_{metric_name}", metric_value)
+                
+                # Log per-class detailed metrics
+                for class_idx in range(args.n_classes):
+                    for metric_type in ['precision', 'recall', 'f1']:
+                        metric_key = f'class_{class_idx}_{metric_type}'
+                        if metric_key in detailed_metrics:
+                            mlflow.log_metric(f"test_{metric_key}", detailed_metrics[metric_key])
+                
+                # Log confidence metrics
+                confidence_metrics = ['mean_confidence', 'confidence_std', 
+                                    'avg_confidence_correct', 'avg_confidence_incorrect']
+                for metric in confidence_metrics:
+                    if metric in detailed_metrics:
+                        mlflow.log_metric(f"test_{metric}", detailed_metrics[metric])
+                        
+            except Exception as e:
+                print(f"Warning: Could not log detailed metrics: {e}")
+
+        # 5. Log artifacts
+        # Log the results DataFrame (predictions, probabilities) as a CSV artifact
         results_path = os.path.join(
             os.path.dirname(ckpt_path), f"{eval_run_name}_results.csv"
         )
         df.to_csv(results_path, index=False)
         mlflow.log_artifact(results_path)
 
+        # Log detailed metrics JSON if available
+        if detailed_results and 'metrics_json_path' in detailed_results:
+            mlflow.log_artifact(detailed_results['metrics_json_path'])
+        
+        # Log visualization artifacts if available
+        if detailed_results and 'artifacts' in detailed_results:
+            for artifact_name, artifact_path in detailed_results['artifacts'].items():
+                if os.path.exists(artifact_path):
+                    mlflow.log_artifact(artifact_path, artifact_path="evaluation_plots")
+
         print("test_error: ", test_error)
         print("auc: ", auc_score)
 
-    return model, patient_results, test_error, auc_score, df
+    return model, patient_results, test_error, auc_score, df, detailed_results
 
 
 def summary(model, loader, args):
@@ -159,7 +249,6 @@ def summary(model, loader, args):
     aucs = []
     if len(np.unique(all_labels)) == 1:
         auc_score = -1
-
     else:
         if args.n_classes == 2:
             auc_score = roc_auc_score(all_labels, all_probs[:, 1])
@@ -185,8 +274,44 @@ def summary(model, loader, args):
             else:
                 auc_score = np.nanmean(np.array(aucs))
 
+    # Calculate detailed metrics if enabled
+    detailed_results = None
+    if args.detailed_metrics:
+        try:
+            from eval import create_detailed_metrics_artifacts
+            
+            # Get fold from args if available
+            fold = getattr(args, 'fold', None)
+            if fold is None:
+                fold = 0  # Default fold value
+                
+            detailed_metrics, artifacts = create_detailed_metrics_artifacts(
+                all_labels, all_preds, all_probs, args, fold
+            )
+            
+            # Calculate additional comprehensive metrics
+            comprehensive_metrics = calculate_detailed_metrics(all_labels, all_preds, all_probs, args.n_classes)
+            detailed_metrics.update(comprehensive_metrics)
+            
+            # Save comprehensive metrics as JSON
+            metrics_json_path = os.path.join(args.save_dir, f"comprehensive_metrics_fold_{fold}.json")
+            with open(metrics_json_path, 'w') as f:
+                json.dump(detailed_metrics, f, indent=2)
+            artifacts["comprehensive_metrics"] = metrics_json_path
+            
+            detailed_results = {
+                'detailed_metrics': detailed_metrics,
+                'artifacts': artifacts,
+                'metrics_json_path': metrics_json_path
+            }
+            
+        except Exception as e:
+            print(f"Warning: Could not generate detailed metrics: {e}")
+            detailed_results = None
+
     results_dict = {"slide_id": slide_ids, "Y": all_labels, "Y_hat": all_preds}
     for c in range(args.n_classes):
         results_dict.update({"p_{}".format(c): all_probs[:, c]})
     df = pd.DataFrame(results_dict)
-    return patient_results, test_error, auc_score, df, acc_logger
+    
+    return patient_results, test_error, auc_score, df, acc_logger, detailed_results
