@@ -1,6 +1,7 @@
 ## eval.py
 
 from __future__ import print_function
+from typing import List, Optional
 
 import numpy as np
 import argparse
@@ -9,6 +10,7 @@ import torch.nn as nn
 import pdb
 import os
 import pandas as pd
+from train import reconstruct_clam_model
 from utils.utils import *
 from math import floor
 import matplotlib.pyplot as plt
@@ -19,7 +21,8 @@ from dataset_modules.dataset_generic import (
 )
 import h5py
 from utils.eval_utils import *
-import mlflow  # <-- ADDED MLflow import
+import mlflow
+from mlflow.models.signature import infer_signature
 
 
 class EvalConfig:
@@ -50,6 +53,11 @@ class EvalConfig:
         self.micro_average = kwargs.get("micro_average", False)
         self.split = kwargs.get("split", "test")
         self.task = kwargs.get("task", None)
+        self.subtyping = kwargs.get("subtyping", False)
+
+        # MLflow model registration parameters
+        self.registered_model_name: Optional[str] = kwargs.get("registered_model_name")
+        self.register_best_model: bool = kwargs.get("register_best_model", True)
 
         # Derived attributes
         self._setup_derived_attributes()
@@ -70,6 +78,10 @@ class EvalConfig:
         )
         # NOTE: Assumes models_exp_code is in the format EXP_CODE_sSEED, matching the training results dir
         self.models_dir = os.path.join(self.results_dir, str(self.models_exp_code))
+
+        # Setup default registered model name
+        if self.registered_model_name is None and self.models_exp_code:
+            self.registered_model_name = f"eval_{self.model_type}_{self.models_exp_code}"
 
         os.makedirs(self.save_dir, exist_ok=True)
 
@@ -147,6 +159,93 @@ def setup_eval_dataset(config):
     return dataset
 
 
+def log_best_model_to_mlflow(
+    config,
+    all_auc: List[float],
+    all_acc: List[float],
+    folds: List[int],
+    ckpt_paths: List[str],
+):
+    """
+    Identify the best model from evaluation results and log it to MLflow
+    using a manually inferred signature.
+    """
+    if not config.register_best_model:
+        print("Model registration is disabled. Skipping...")
+        return None
+
+    # Find the best fold based on evaluation AUC
+    best_fold_idx = np.argmax(all_auc)
+    best_fold = folds[best_fold_idx]
+    best_auc = all_auc[best_fold_idx]
+    best_acc = all_acc[best_fold_idx]
+
+    print(f"Best model from fold {best_fold} with {config.split} AUC: {best_auc:.4f}")
+
+    # Load the best model checkpoint
+    best_model_checkpoint_path = ckpt_paths[best_fold_idx]
+
+    if not os.path.exists(best_model_checkpoint_path):
+        print(f"Warning: Best model checkpoint not found at {best_model_checkpoint_path}")
+        return None
+
+    try:
+        # Define explicit requirements
+        pip_reqs = [
+            "timm==0.9.8",
+            "torch==2.8.0+cu128",
+            "torchvision==0.23.0+cu128",
+            "torchaudio==2.8.0+cu128",
+            f"mlflow=={mlflow.__version__}",
+            "numpy",
+            "pandas",
+        ]
+
+        # Create dummy input for signature inference
+        L = 500  # number of instances (patches)
+        D = config.embed_dim
+        dummy_input_np = np.random.randn(L, D).astype(np.float32)
+        dummy_input_torch = torch.from_numpy(dummy_input_np)
+
+        # Reconstruct the model architecture and load weights
+        best_model = reconstruct_clam_model(config, best_model_checkpoint_path)
+
+        # Generate signature by passing dummy input through the model
+        with torch.no_grad():
+            output = best_model(dummy_input_torch)
+            Y_prob = output[0] if isinstance(output, tuple) else output
+
+        Y_prob_np = Y_prob.cpu().numpy()
+        signature = infer_signature(model_input=dummy_input_np, model_output=Y_prob_np)
+
+        # Log the reconstructed model using explicit signature
+        print("Logging best model to MLflow...")
+        mlflow.pytorch.log_model(
+            best_model,
+            name="models",
+            registered_model_name=config.registered_model_name,
+            pip_requirements=pip_reqs,
+            signature=signature,
+        )
+
+        print(f"✅ Successfully registered model: {config.registered_model_name}")
+        print(f"   - Best {config.split} AUC: {best_auc:.4f}")
+        print(f"   - Best {config.split} Accuracy: {best_acc:.4f}")
+        print(f"   - From fold: {best_fold}")
+
+        # Log additional metrics for the best model
+        mlflow.set_tag("best_model_fold", str(best_fold))
+        mlflow.set_tag("best_model_source", "evaluation")
+        mlflow.log_metric(f"best_{config.split}_auc", best_auc)
+        mlflow.log_metric(f"best_{config.split}_accuracy", best_acc)
+
+        return best_model
+
+    except Exception as e:
+        print(f"Error logging model to MLflow: {e}")
+        return None
+
+
 def run_evaluation(config):
     """
     Main evaluation function. Starts the MLflow parent run
@@ -156,7 +255,7 @@ def run_evaluation(config):
     # ====================================================================
     # MLFLOW INTEGRATION: Start the main run for multi-fold evaluation
     # ====================================================================
-    experiment_name = f"Eval_{config.exp_code}"
+    experiment_name = f"Eval_{config.models_exp_code}"
     mlflow.set_experiment(experiment_name)
 
     run_name = f"Aggregate_{config.split}_from_{config.models_exp_code}"
@@ -219,34 +318,6 @@ def run_evaluation(config):
                 split_dataset, config, ckpt_paths[ckpt_idx]
             )
 
-            # ====================================================================
-            # MLFLOW INTEGRATION: Log the first loaded model to the aggregate run
-            # This is a good practice to ensure at least one full model artifact
-            # is linked to the overall evaluation run.
-            # ====================================================================
-            if ckpt_idx == 0:
-                print(f"Logging model checkpoint for fold {fold} to MLflow...")
-                try:
-                    # Create a dummy input for model signature inference
-                    # Assuming CLAM model input: (L x D) tensor
-                    L = 500  # Example number of instances/patches
-                    D = config.embed_dim  # Embedding dimension (e.g., 1024)
-                    dummy_input = torch.randn(L, D, dtype=torch.float32).numpy()
-
-                    mlflow.pytorch.log_model(
-                        model,
-                        artifact_path=f"model_fold_{fold}",
-                        input_example=dummy_input,
-                        # Set strict=False as the model state dict may contain extra keys (like 'instance_loss_fn.labels')
-                        # However, log_model logs the *PyTorch model object*, not the state_dict directly,
-                        # so the model must be on CPU if using a non-GPU environment for MLflow server.
-                        # We assume 'model' object can be logged without issues here.
-                    )
-                    mlflow.set_tag("Model_Artifact_Source_Fold", fold)
-                    print(f"Model from fold {fold} successfully logged.")
-                except Exception as e:
-                    print(f"Warning: Failed to log model to MLflow: {e}")
-
             all_results.append(patient_results)
             all_auc.append(auc)
             all_acc.append(1 - test_error)
@@ -261,6 +332,14 @@ def run_evaluation(config):
             )
             # Log the individual fold CSV as an artifact in the *parent* run too
             mlflow.log_artifact(fold_results_path, artifact_path="fold_results")
+
+        # ====================================================================
+        # MLFLOW INTEGRATION: Log the best model based on evaluation metrics
+        # ====================================================================
+        if config.register_best_model:
+            best_model = log_best_model_to_mlflow(
+                config, all_auc, all_acc, list(config.folds), ckpt_paths
+            )
 
         # Save summary
         final_df = pd.DataFrame(
@@ -351,7 +430,9 @@ def create_parser():
     )
     parser.add_argument("--drop_out", type=float, default=0.25, help="dropout")
     parser.add_argument("--embed_dim", type=int, default=1024)
-
+    parser.add_argument(
+        "--subtyping", action="store_true", default=False, help="subtyping problem"
+    )
     # Evaluation parameters
     parser.add_argument(
         "--k", type=int, default=10, help="number of folds (default: 10)"
@@ -375,6 +456,19 @@ def create_parser():
     parser.add_argument(
         "--task", type=str, choices=["task_1_tumor_vs_normal", "task_2_tumor_subtyping"]
     )
+    # MLflow model registration options
+    parser.add_argument(
+        "--registered_model_name",
+        type=str,
+        default=None,
+        help="Name for registering the model in MLflow Model Registry",
+    )
+    parser.add_argument(
+        "--no_register_model",
+        action="store_true",
+        default=False,
+        help="Disable model registration in MLflow",
+    )
 
     return parser
 
@@ -386,6 +480,8 @@ def main():
 
     # Convert args to dictionary and create config
     config_dict = vars(args)
+    config_dict["register_best_model"] = not args.no_register_model
+
     config = EvalConfig(**config_dict)
 
     # Run evaluation

@@ -9,7 +9,7 @@ import pdb
 import os
 import pandas as pd
 from utils.utils import *
-from utils.train_utils import Accuracy_Logger
+from utils.train_utils import AccuracyLogger
 from sklearn.metrics import roc_auc_score, roc_curve, auc
 from sklearn.preprocessing import label_binarize
 import matplotlib.pyplot as plt
@@ -110,7 +110,7 @@ def eval(dataset, args, ckpt_path):
 
 
 def summary(model, loader, args):
-    acc_logger = Accuracy_Logger(n_classes=args.n_classes)
+    acc_logger = AccuracyLogger(n_classes=args.n_classes)
     model.eval()
     test_loss = 0.0
     test_error = 0.0

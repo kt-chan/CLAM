@@ -1,3 +1,4 @@
+import os
 import pickle
 import torch
 import numpy as np
@@ -164,3 +165,19 @@ def initialize_weights(module):
 			nn.init.constant_(m.weight, 1)
 			nn.init.constant_(m.bias, 0)
 
+
+def seed_torch(seed: int = 7) -> None:
+    """Set random seed for reproducibility across Python, NumPy, and PyTorch."""
+    import random
+
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    # Configure CuDNN for deterministic results
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True

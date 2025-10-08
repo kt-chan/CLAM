@@ -16,11 +16,11 @@
             // --- Script Arguments ---
             "args": [
                 "--k",
-                "1",
+                "2",
                 "--models_exp_code",
-                "task_1_tumor_vs_normal_resnet50_s1",
+                "task_1_tumor_vs_normal_resnet50",
                 "--save_exp_code",
-                "task_1_tumor_vs_normal_resnet50_s1_cv",
+                "task_1_tumor_vs_normal_resnet50_cv",
                 "--task",
                 "task_1_tumor_vs_normal",
                 "--model_type",
@@ -50,14 +50,14 @@
             // --- Script Arguments ---
             "args": [
                 "--max_epochs",
-                "1",
+                "3",
                 "--drop_out",
                 "0.25",
                 "--early_stopping",
                 "--lr",
                 "2e-4",
                 "--k",
-                "1",
+                "2",
                 "--exp_code",
                 "task_1_tumor_vs_normal_resnet50",
                 "--weighted_sample",
