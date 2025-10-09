@@ -1277,6 +1277,9 @@ class CrossValidationTrainer:
         self.config = config
         self.dataset = dataset
         self._validate_config()
+        # ✅ Set seed exactly ONCE
+        print(f"Setting random seed: {config.seed}")
+        seed_torch(config.seed)
 
     def _validate_config(self) -> None:
         """Validate configuration before training"""
@@ -1315,9 +1318,6 @@ class CrossValidationTrainer:
     def run_cross_validation(self) -> TrainingResults:
         """Run complete cross-validation training"""
         with self.setup_mlflow_experiment() as run:
-            # Setup device and seed
-            seed_torch(self.config.seed)
-
             # Log settings
             self.log_experiment_settings()
 
@@ -1356,8 +1356,6 @@ class CrossValidationTrainer:
         folds = np.arange(self.config.start_fold, self.config.end_fold)
 
         for fold_idx in folds:
-            seed_torch(self.config.seed)
-
             # Get dataset splits for this fold
             train_dataset, val_dataset, test_dataset = self.dataset.return_splits(
                 from_id=False,

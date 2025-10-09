@@ -7,7 +7,7 @@ import argparse
 import torch
 import os
 import pandas as pd
-from train import reconstruct_clam_model
+
 from utils.utils import *
 import matplotlib.pyplot as plt
 from dataset_modules.dataset_generic import (
@@ -283,116 +283,6 @@ def create_detailed_metrics_artifacts(
     return metrics_dict, artifacts
 
 
-def log_best_model_to_mlflow(
-    config: EvalConfig,
-    all_auc: List[float],
-    all_acc: List[float],
-    all_detailed_metrics: List[Dict[str, Any]],
-    folds: List[int],
-    ckpt_paths: List[str],
-) -> Optional[torch.nn.Module]:
-    """Identify the best model from evaluation results and log it to MLflow."""
-    if not config.register_best_model:
-        print("Model registration is disabled. Skipping...")
-        return None
-
-    # Find the best fold based on evaluation AUC
-    best_fold_idx: int = np.argmax(all_auc)
-    best_fold: int = folds[best_fold_idx]
-    best_auc: float = all_auc[best_fold_idx]
-    best_acc: float = all_acc[best_fold_idx]
-
-    print(f"Best model from fold {best_fold} with {config.split} AUC: {best_auc:.4f}")
-
-    # Load the best model checkpoint
-    best_model_checkpoint_path: str = ckpt_paths[best_fold_idx]
-
-    if not os.path.exists(best_model_checkpoint_path):
-        print(
-            f"Warning: Best model checkpoint not found at {best_model_checkpoint_path}"
-        )
-        return None
-
-    try:
-        # Define explicit requirements
-        pip_reqs: List[str] = [
-            "timm==0.9.8",
-            "torch==2.8.0+cu128",
-            "torchvision==0.23.0+cu128",
-            "torchaudio==2.8.0+cu128",
-            f"mlflow=={mlflow.__version__}",
-            "numpy",
-            "pandas",
-        ]
-
-        # Create dummy input for signature inference
-        L: int = 500  # number of instances (patches)
-        D: int = config.embed_dim
-        dummy_input_np: np.ndarray = np.random.randn(L, D).astype(np.float32)
-        dummy_input_torch: torch.Tensor = torch.from_numpy(dummy_input_np)
-
-        # Reconstruct the model architecture and load weights
-        best_model: torch.nn.Module = reconstruct_clam_model(
-            config, best_model_checkpoint_path
-        )
-
-        # Generate signature by passing dummy input through the model
-        with torch.no_grad():
-            output: Union[torch.Tensor, Tuple[torch.Tensor, ...]] = best_model(
-                dummy_input_torch
-            )
-            Y_prob: torch.Tensor = output[0] if isinstance(output, tuple) else output
-
-        Y_prob_np: np.ndarray = Y_prob.cpu().numpy()
-        signature = infer_signature(model_input=dummy_input_np, model_output=Y_prob_np)
-
-        # Log the reconstructed model using explicit signature
-        print("Logging best model to MLflow...")
-        mlflow.pytorch.log_model(
-            best_model,
-            name="models",
-            registered_model_name=config.registered_model_name,
-            pip_requirements=pip_reqs,
-            signature=signature,
-        )
-
-        print(f"✅ Successfully registered model: {config.registered_model_name}")
-        print(f"   - Best {config.split} AUC: {best_auc:.4f}")
-        print(f"   - Best {config.split} Accuracy: {best_acc:.4f}")
-        print(f"   - From fold: {best_fold}")
-
-        # Log additional metrics for the best model
-        mlflow.set_tag("best_model_fold", str(best_fold))
-        mlflow.set_tag("best_model_source", "evaluation")
-        mlflow.log_metric(f"best_{config.split}_auc", best_auc)
-        mlflow.log_metric(f"best_{config.split}_accuracy", best_acc)
-
-        # Log detailed metrics for the best model if available
-        if all_detailed_metrics and best_fold_idx < len(all_detailed_metrics):
-            best_detailed_metrics: Optional[Dict[str, Any]] = all_detailed_metrics[
-                best_fold_idx
-            ]
-            if best_detailed_metrics:
-                mlflow.log_metric(
-                    f"best_{config.split}_precision",
-                    best_detailed_metrics.get("macro_avg_precision", 0.0),
-                )
-                mlflow.log_metric(
-                    f"best_{config.split}_recall",
-                    best_detailed_metrics.get("macro_avg_recall", 0.0),
-                )
-                mlflow.log_metric(
-                    f"best_{config.split}_f1_score",
-                    best_detailed_metrics.get("macro_avg_f1_score", 0.0),
-                )
-
-        return best_model
-
-    except Exception as e:
-        print(f"Error logging model to MLflow: {e}")
-        return None
-
-
 def run_evaluation(config: EvalConfig) -> Dict[str, Any]:
     """Main evaluation function. Starts the MLflow parent run for multi-fold evaluation."""
     # MLFLOW INTEGRATION: Start the main run for multi-fold evaluation
@@ -472,18 +362,6 @@ def run_evaluation(config: EvalConfig) -> Dict[str, Any]:
 
             # Log the individual fold CSV as an artifact in the *parent* run too
             mlflow.log_artifact(fold_results_path, artifact_path="fold_results")
-
-        # MLFLOW INTEGRATION: Log the best model based on evaluation metrics
-        best_model: Optional[torch.nn.Module] = None
-        if config.register_best_model:
-            best_model = log_best_model_to_mlflow(
-                config,
-                all_auc,
-                all_acc,
-                all_detailed_metrics,
-                list(config.folds),
-                ckpt_paths,
-            )
 
         # Save summary
         final_df: pd.DataFrame = pd.DataFrame(

@@ -16,7 +16,7 @@
             // --- Script Arguments ---
             "args": [
                 "--k",
-                "10",
+                "2",
                 "--models_exp_code",
                 "task_1_tumor_vs_normal_resnet50",
                 "--save_exp_code",
@@ -50,14 +50,14 @@
             // --- Script Arguments ---
             "args": [
                 "--max_epochs",
-                "2",
+                "10",
                 "--drop_out",
                 "0.25",
                 "--early_stopping",
                 "--lr",
                 "2e-4",
                 "--k",
-                "2",
+                "10",
                 "--exp_code",
                 "task_1_tumor_vs_normal_resnet50",
                 "--weighted_sample",
@@ -73,7 +73,7 @@
                 "--data_root_dir",
                 "./data/features/",
                 "--data_set_name",
-                "TCGA",
+                "MHIST",
                 "--embed_dim",
                 "1024"
             ]
@@ -94,20 +94,23 @@
             "args": [
                 // Directory containing patch coordinates (.h5 files from the patching step)
                 "--data_h5_dir",
-                "./data/outputs/TCGA",
+                "./data/outputs/MHIST",
                 // Directory containing the original WSI files (.svs)
                 "--data_slide_dir",
-                "./data/inputs/TCGA",
+                "./data/inputs/MHIST/images",
                 // Directory where the final feature vectors (.pt files) will be saved
                 "--feat_dir",
-                "./data/features/TCGA",
+                "./data/features/MHIST",
+                // slide extension (e.g. .svs / .png)
+                "--slide_ext",
+                ".png",
                 // Model encoder to use (e.g., resnet50_trunc, uni, conch)
                 "--model_name",
                 "resnet50_trunc",
                 "--batch_size",
-                "512",
+                "2048",
                 "--csv_path",
-                "./data/outputs/TCGA/process_list_autogen.csv"
+                "./data/outputs/MHIST/process_list_autogen.csv"
             ]
         },
         {
@@ -117,11 +120,11 @@
             "program": "create_patches_fp.py",
             "args": [
                 "--source",
-                "./data/inputs/TCGA",
+                "./data/inputs/MHIST/images",
                 "--save_dir",
-                "./data/outputs/TCGA",
+                "./data/outputs/MHIST",
                 "--patch_size",
-                "256",
+                "224",
                 "--seg",
                 "--patch",
                 "--stitch"

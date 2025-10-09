@@ -16,7 +16,7 @@
             // --- Script Arguments ---
             "args": [
                 "--k",
-                "10",
+                "2",
                 "--models_exp_code",
                 "task_1_tumor_vs_normal_resnet50",
                 "--save_exp_code",
