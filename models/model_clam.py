@@ -12,23 +12,24 @@ args:
     dropout: whether to use dropout (p = 0.25)
     n_classes: number of classes 
 """
+
+
 class Attn_Net(nn.Module):
 
-    def __init__(self, L = 1024, D = 256, dropout = False, n_classes = 1):
+    def __init__(self, L=1024, D=256, dropout=False, n_classes=1):
         super(Attn_Net, self).__init__()
-        self.module = [
-            nn.Linear(L, D),
-            nn.Tanh()]
+        self.module = [nn.Linear(L, D), nn.Tanh()]
 
         if dropout:
             self.module.append(nn.Dropout(0.25))
 
         self.module.append(nn.Linear(D, n_classes))
-        
+
         self.module = nn.Sequential(*self.module)
-    
+
     def forward(self, x):
-        return self.module(x), x # N x n_classes
+        return self.module(x), x  # N x n_classes
+
 
 """
 Attention Network with Sigmoid Gating (3 fc layers)
@@ -38,22 +39,21 @@ args:
     dropout: whether to use dropout (p = 0.25)
     n_classes: number of classes 
 """
+
+
 class Attn_Net_Gated(nn.Module):
-    def __init__(self, L = 1024, D = 256, dropout = False, n_classes = 1):
+    def __init__(self, L=1024, D=256, dropout=False, n_classes=1):
         super(Attn_Net_Gated, self).__init__()
-        self.attention_a = [
-            nn.Linear(L, D),
-            nn.Tanh()]
-        
-        self.attention_b = [nn.Linear(L, D),
-                            nn.Sigmoid()]
+        self.attention_a = [nn.Linear(L, D), nn.Tanh()]
+
+        self.attention_b = [nn.Linear(L, D), nn.Sigmoid()]
         if dropout:
             self.attention_a.append(nn.Dropout(0.25))
             self.attention_b.append(nn.Dropout(0.25))
 
         self.attention_a = nn.Sequential(*self.attention_a)
         self.attention_b = nn.Sequential(*self.attention_b)
-        
+
         self.attention_c = nn.Linear(D, n_classes)
 
     def forward(self, x):
@@ -62,6 +62,7 @@ class Attn_Net_Gated(nn.Module):
         A = a.mul(b)
         A = self.attention_c(A)  # N x n_classes
         return A, x
+
 
 """
 args:
@@ -74,17 +75,30 @@ args:
     instance_loss_fn: loss function to supervise instance-level training
     subtyping: whether it's a subtyping problem
 """
+
+
 class CLAM_SB(nn.Module):
-    def __init__(self, gate = True, size_arg = "small", dropout = 0., k_sample=8, n_classes=2,
-        instance_loss_fn=nn.CrossEntropyLoss(), subtyping=False, embed_dim=1024):
+    def __init__(
+        self,
+        gate=True,
+        size_arg="small",
+        dropout=0.0,
+        k_sample=8,
+        n_classes=2,
+        instance_loss_fn=nn.CrossEntropyLoss(),
+        subtyping=False,
+        embed_dim=1024,
+    ):
         super().__init__()
         self.size_dict = {"small": [embed_dim, 512, 256], "big": [embed_dim, 512, 384]}
         size = self.size_dict[size_arg]
         fc = [nn.Linear(size[0], size[1]), nn.ReLU(), nn.Dropout(dropout)]
         if gate:
-            attention_net = Attn_Net_Gated(L = size[1], D = size[2], dropout = dropout, n_classes = 1)
+            attention_net = Attn_Net_Gated(
+                L=size[1], D=size[2], dropout=dropout, n_classes=1
+            )
         else:
-            attention_net = Attn_Net(L = size[1], D = size[2], dropout = dropout, n_classes = 1)
+            attention_net = Attn_Net(L=size[1], D=size[2], dropout=dropout, n_classes=1)
         fc.append(attention_net)
         self.attention_net = nn.Sequential(*fc)
         self.classifiers = nn.Linear(size[1], n_classes)
@@ -94,18 +108,18 @@ class CLAM_SB(nn.Module):
         self.instance_loss_fn = instance_loss_fn
         self.n_classes = n_classes
         self.subtyping = subtyping
-    
+
     @staticmethod
     def create_positive_targets(length, device):
-        return torch.full((length, ), 1, device=device).long()
-    
+        return torch.full((length,), 1, device=device).long()
+
     @staticmethod
     def create_negative_targets(length, device):
-        return torch.full((length, ), 0, device=device).long()
-    
-    #instance-level evaluation for in-the-class attention branch
-    def inst_eval(self, A, h, classifier): 
-        device=h.device
+        return torch.full((length,), 0, device=device).long()
+
+    # instance-level evaluation for in-the-class attention branch
+    def inst_eval(self, A, h, classifier):
+        device = h.device
         if len(A.shape) == 1:
             A = A.view(1, -1)
         top_p_ids = torch.topk(A, self.k_sample)[1][-1]
@@ -118,25 +132,32 @@ class CLAM_SB(nn.Module):
         all_targets = torch.cat([p_targets, n_targets], dim=0)
         all_instances = torch.cat([top_p, top_n], dim=0)
         logits = classifier(all_instances)
-        all_preds = torch.topk(logits, 1, dim = 1)[1].squeeze(1)
+        all_preds = torch.topk(logits, 1, dim=1)[1].squeeze(1)
         instance_loss = self.instance_loss_fn(logits, all_targets)
         return instance_loss, all_preds, all_targets
-    
-    #instance-level evaluation for out-of-the-class attention branch
+
+    # instance-level evaluation for out-of-the-class attention branch
     def inst_eval_out(self, A, h, classifier):
-        device=h.device
+        device = h.device
         if len(A.shape) == 1:
             A = A.view(1, -1)
         top_p_ids = torch.topk(A, self.k_sample)[1][-1]
         top_p = torch.index_select(h, dim=0, index=top_p_ids)
         p_targets = self.create_negative_targets(self.k_sample, device)
         logits = classifier(top_p)
-        p_preds = torch.topk(logits, 1, dim = 1)[1].squeeze(1)
+        p_preds = torch.topk(logits, 1, dim=1)[1].squeeze(1)
         instance_loss = self.instance_loss_fn(logits, p_targets)
         return instance_loss, p_preds, p_targets
 
-    def forward(self, h, label=None, instance_eval=False, return_features=False, attention_only=False):
-        A, h = self.attention_net(h)  # NxK        
+    def forward(
+        self,
+        h,
+        label=None,
+        instance_eval=False,
+        return_features=False,
+        attention_only=False,
+    ):
+        A, h = self.attention_net(h)  # NxK
         A = torch.transpose(A, 1, 0)  # KxN
         if attention_only:
             return A
@@ -147,17 +168,21 @@ class CLAM_SB(nn.Module):
             total_inst_loss = 0.0
             all_preds = []
             all_targets = []
-            inst_labels = F.one_hot(label, num_classes=self.n_classes).squeeze() #binarize label
+            inst_labels = F.one_hot(
+                label, num_classes=self.n_classes
+            ).squeeze()  # binarize label
             for i in range(len(self.instance_classifiers)):
                 inst_label = inst_labels[i].item()
                 classifier = self.instance_classifiers[i]
-                if inst_label == 1: #in-the-class:
+                if inst_label == 1:  # in-the-class:
                     instance_loss, preds, targets = self.inst_eval(A, h, classifier)
                     all_preds.extend(preds.cpu().numpy())
                     all_targets.extend(targets.cpu().numpy())
-                else: #out-of-the-class
+                else:  # out-of-the-class
                     if self.subtyping:
-                        instance_loss, preds, targets = self.inst_eval_out(A, h, classifier)
+                        instance_loss, preds, targets = self.inst_eval_out(
+                            A, h, classifier
+                        )
                         all_preds.extend(preds.cpu().numpy())
                         all_targets.extend(targets.cpu().numpy())
                     else:
@@ -166,34 +191,53 @@ class CLAM_SB(nn.Module):
 
             if self.subtyping:
                 total_inst_loss /= len(self.instance_classifiers)
-                
-        M = torch.mm(A, h) 
+
+        M = torch.mm(A, h)
         logits = self.classifiers(M)
-        Y_hat = torch.topk(logits, 1, dim = 1)[1]
-        Y_prob = F.softmax(logits, dim = 1)
+        Y_hat = torch.topk(logits, 1, dim=1)[1]
+        Y_prob = F.softmax(logits, dim=1)
         if instance_eval:
-            results_dict = {'instance_loss': total_inst_loss, 'inst_labels': np.array(all_targets), 
-            'inst_preds': np.array(all_preds)}
+            results_dict = {
+                "instance_loss": total_inst_loss,
+                "inst_labels": np.array(all_targets),
+                "inst_preds": np.array(all_preds),
+            }
         else:
             results_dict = {}
         if return_features:
-            results_dict.update({'features': M})
+            results_dict.update({"features": M})
         return logits, Y_prob, Y_hat, A_raw, results_dict
 
+
 class CLAM_MB(CLAM_SB):
-    def __init__(self, gate = True, size_arg = "small", dropout = 0., k_sample=8, n_classes=2,
-        instance_loss_fn=nn.CrossEntropyLoss(), subtyping=False, embed_dim=1024):
+    def __init__(
+        self,
+        gate=True,
+        size_arg="small",
+        dropout=0.0,
+        k_sample=8,
+        n_classes=2,
+        instance_loss_fn=nn.CrossEntropyLoss(),
+        subtyping=False,
+        embed_dim=1024,
+    ):
         nn.Module.__init__(self)
         self.size_dict = {"small": [embed_dim, 512, 256], "big": [embed_dim, 512, 384]}
         size = self.size_dict[size_arg]
         fc = [nn.Linear(size[0], size[1]), nn.ReLU(), nn.Dropout(dropout)]
         if gate:
-            attention_net = Attn_Net_Gated(L = size[1], D = size[2], dropout = dropout, n_classes = n_classes)
+            attention_net = Attn_Net_Gated(
+                L=size[1], D=size[2], dropout=dropout, n_classes=n_classes
+            )
         else:
-            attention_net = Attn_Net(L = size[1], D = size[2], dropout = dropout, n_classes = n_classes)
+            attention_net = Attn_Net(
+                L=size[1], D=size[2], dropout=dropout, n_classes=n_classes
+            )
         fc.append(attention_net)
         self.attention_net = nn.Sequential(*fc)
-        bag_classifiers = [nn.Linear(size[1], 1) for i in range(n_classes)] #use an indepdent linear layer to predict each class
+        bag_classifiers = [
+            nn.Linear(size[1], 1) for i in range(n_classes)
+        ]  # use an indepdent linear layer to predict each class
         self.classifiers = nn.ModuleList(bag_classifiers)
         instance_classifiers = [nn.Linear(size[1], 2) for i in range(n_classes)]
         self.instance_classifiers = nn.ModuleList(instance_classifiers)
@@ -202,8 +246,15 @@ class CLAM_MB(CLAM_SB):
         self.n_classes = n_classes
         self.subtyping = subtyping
 
-    def forward(self, h, label=None, instance_eval=False, return_features=False, attention_only=False):
-        A, h = self.attention_net(h)  # NxK        
+    def forward(
+        self,
+        h,
+        label=None,
+        instance_eval=False,
+        return_features=False,
+        attention_only=False,
+    ):
+        A, h = self.attention_net(h)  # NxK
         A = torch.transpose(A, 1, 0)  # KxN
         if attention_only:
             return A
@@ -214,17 +265,21 @@ class CLAM_MB(CLAM_SB):
             total_inst_loss = 0.0
             all_preds = []
             all_targets = []
-            inst_labels = F.one_hot(label, num_classes=self.n_classes).squeeze() #binarize label
+            inst_labels = F.one_hot(
+                label, num_classes=self.n_classes
+            ).squeeze()  # binarize label
             for i in range(len(self.instance_classifiers)):
                 inst_label = inst_labels[i].item()
                 classifier = self.instance_classifiers[i]
-                if inst_label == 1: #in-the-class:
+                if inst_label == 1:  # in-the-class:
                     instance_loss, preds, targets = self.inst_eval(A[i], h, classifier)
                     all_preds.extend(preds.cpu().numpy())
                     all_targets.extend(targets.cpu().numpy())
-                else: #out-of-the-class
+                else:  # out-of-the-class
                     if self.subtyping:
-                        instance_loss, preds, targets = self.inst_eval_out(A[i], h, classifier)
+                        instance_loss, preds, targets = self.inst_eval_out(
+                            A[i], h, classifier
+                        )
                         all_preds.extend(preds.cpu().numpy())
                         all_targets.extend(targets.cpu().numpy())
                     else:
@@ -234,19 +289,357 @@ class CLAM_MB(CLAM_SB):
             if self.subtyping:
                 total_inst_loss /= len(self.instance_classifiers)
 
-        M = torch.mm(A, h) 
+        M = torch.mm(A, h)
 
         logits = torch.empty(1, self.n_classes).float().to(M.device)
         for c in range(self.n_classes):
             logits[0, c] = self.classifiers[c](M[c])
 
-        Y_hat = torch.topk(logits, 1, dim = 1)[1]
-        Y_prob = F.softmax(logits, dim = 1)
+        Y_hat = torch.topk(logits, 1, dim=1)[1]
+        Y_prob = F.softmax(logits, dim=1)
         if instance_eval:
-            results_dict = {'instance_loss': total_inst_loss, 'inst_labels': np.array(all_targets), 
-            'inst_preds': np.array(all_preds)}
+            results_dict = {
+                "instance_loss": total_inst_loss,
+                "inst_labels": np.array(all_targets),
+                "inst_preds": np.array(all_preds),
+            }
         else:
             results_dict = {}
         if return_features:
-            results_dict.update({'features': M})
+            results_dict.update({"features": M})
         return logits, Y_prob, Y_hat, A_raw, results_dict
+
+
+class CLAM_SB_Regression(nn.Module):
+    def __init__(
+        self,
+        gate=True,
+        size_arg="small",
+        dropout=0.0,
+        k_sample=8,
+        n_classes=2,
+        instance_loss_fn=nn.CrossEntropyLoss(),
+        subtyping=False,
+        embed_dim=1024,
+    ):
+        super().__init__()
+        self.size_dict = {"small": [embed_dim, 512, 256], "big": [embed_dim, 512, 384]}
+        size = self.size_dict[size_arg]
+        fc = [nn.Linear(size[0], size[1]), nn.ReLU(), nn.Dropout(dropout)]
+        if gate:
+            attention_net = Attn_Net_Gated(
+                L=size[1], D=size[2], dropout=dropout, n_classes=1
+            )
+        else:
+            attention_net = Attn_Net(L=size[1], D=size[2], dropout=dropout, n_classes=1)
+        fc.append(attention_net)
+        self.attention_net = nn.Sequential(*fc)
+
+        # Regression output for primary and secondary Gleason patterns
+        self.regressors = nn.Linear(size[1], 2)  # Output: [primary, secondary]
+
+        # Instance classifiers for pattern detection (now for regression guidance)
+        instance_classifiers = [
+            nn.Linear(size[1], 2) for i in range(2)
+        ]  # Two for primary/secondary pattern detection
+        self.instance_classifiers = nn.ModuleList(instance_classifiers)
+        self.k_sample = k_sample
+        self.instance_loss_fn = instance_loss_fn
+        self.n_classes = n_classes
+        self.subtyping = subtyping
+
+    @staticmethod
+    def create_positive_targets(length, device):
+        return torch.full((length,), 1, device=device).long()
+
+    @staticmethod
+    def create_negative_targets(length, device):
+        return torch.full((length,), 0, device=device).long()
+
+    # Instance-level evaluation for pattern detection
+    def inst_eval(self, A, h, classifier):
+        device = h.device
+        if len(A.shape) == 1:
+            A = A.view(1, -1)
+        top_p_ids = torch.topk(A, self.k_sample)[1][-1]
+        top_p = torch.index_select(h, dim=0, index=top_p_ids)
+        top_n_ids = torch.topk(-A, self.k_sample, dim=1)[1][-1]
+        top_n = torch.index_select(h, dim=0, index=top_n_ids)
+        p_targets = self.create_positive_targets(self.k_sample, device)
+        n_targets = self.create_negative_targets(self.k_sample, device)
+
+        all_targets = torch.cat([p_targets, n_targets], dim=0)
+        all_instances = torch.cat([top_p, top_n], dim=0)
+        logits = classifier(all_instances)
+        all_preds = torch.topk(logits, 1, dim=1)[1].squeeze(1)
+        instance_loss = self.instance_loss_fn(logits, all_targets)
+        return instance_loss, all_preds, all_targets
+
+    # Instance-level evaluation for out-of-class pattern detection
+    def inst_eval_out(self, A, h, classifier):
+        device = h.device
+        if len(A.shape) == 1:
+            A = A.view(1, -1)
+        top_p_ids = torch.topk(A, self.k_sample)[1][-1]
+        top_p = torch.index_select(h, dim=0, index=top_p_ids)
+        p_targets = self.create_negative_targets(self.k_sample, device)
+        logits = classifier(top_p)
+        p_preds = torch.topk(logits, 1, dim=1)[1].squeeze(1)
+        instance_loss = self.instance_loss_fn(logits, p_targets)
+        return instance_loss, p_preds, p_targets
+
+    def forward(
+        self,
+        h,
+        label=None,
+        instance_eval=False,
+        return_features=False,
+        attention_only=False,
+    ):
+        A, h = self.attention_net(h)  # NxK
+        A = torch.transpose(A, 1, 0)  # KxN
+        if attention_only:
+            return A
+        A_raw = A
+        A = F.softmax(A, dim=1)  # softmax over N
+
+        if instance_eval:
+            total_inst_loss = 0.0
+            all_preds = []
+            all_targets = []
+
+            # For regression, we use instance evaluation to detect pattern presence
+            if label is not None:
+                primary_label, secondary_label = extract_pattern_labels(label)
+
+                # Create tensor from Python scalars
+                inst_labels = torch.tensor(
+                    [primary_label, secondary_label], device=h.device
+                )
+
+                for i in range(len(self.instance_classifiers)):
+                    inst_label = inst_labels[i].item()
+                    classifier = self.instance_classifiers[i]
+                    if inst_label == 1:  # Pattern present
+                        instance_loss, preds, targets = self.inst_eval(A, h, classifier)
+                    else:  # Pattern not prominent,  Use negative sampling or alternative approach
+                        instance_loss, preds, targets = self.inst_eval_out(A, h, classifier)
+
+                    all_preds.extend(preds.cpu().numpy())
+                    all_targets.extend(targets.cpu().numpy())
+                    total_inst_loss += instance_loss
+
+            if self.subtyping:
+                total_inst_loss /= len(self.instance_classifiers)
+
+        M = torch.mm(A, h)
+
+        # Regression output for primary and secondary patterns
+        pattern_logits = self.regressors(M)  # [primary, secondary]
+
+        # Apply constraints: primary >= secondary, both between 3-5
+        primary = pattern_logits[0, 0]
+        secondary = pattern_logits[0, 1]
+
+        # Ensure primary >= secondary
+        constraint_loss = None
+        if self.training:
+            # Soft constraint with gradient flow
+            diff = secondary - primary
+            constraint_loss = F.relu(diff)  # Penalize if secondary > primary
+        else:
+            # Hard constraint for inference
+            if secondary > primary:
+                pattern_logits[0, 0], pattern_logits[0, 1] = (
+                    pattern_logits[0, 1],
+                    pattern_logits[0, 0],
+                )
+
+        # Apply sigmoid to get values between 0-1, then scale to 3-5 range
+        pattern_values = torch.sigmoid(pattern_logits) * 2 + 3  # Scale to [3,5] range
+
+        # For continuous regression, predictions are the same as values
+        pattern_predictions = pattern_values  # Continuous predictions
+
+        if instance_eval:
+            results_dict = {
+                "instance_loss": total_inst_loss,
+                "inst_labels": np.array(all_targets),
+                "inst_preds": np.array(all_preds),
+            }
+            if constraint_loss is not None:
+                results_dict["constraint_loss"] = constraint_loss
+        else:
+            results_dict = {}
+        if return_features:
+            results_dict.update({"features": M})
+
+        return pattern_logits, pattern_values, pattern_predictions, A_raw, results_dict
+
+
+class CLAM_MB_Regression(CLAM_SB_Regression):
+    def __init__(
+        self,
+        gate=True,
+        size_arg="small",
+        dropout=0.0,
+        k_sample=8,
+        n_classes=2,
+        instance_loss_fn=nn.CrossEntropyLoss(),
+        subtyping=False,
+        embed_dim=1024,
+    ):
+        nn.Module.__init__(self)
+        self.size_dict = {"small": [embed_dim, 512, 256], "big": [embed_dim, 512, 384]}
+        size = self.size_dict[size_arg]
+        fc = [nn.Linear(size[0], size[1]), nn.ReLU(), nn.Dropout(dropout)]
+        if gate:
+            attention_net = Attn_Net_Gated(
+                L=size[1], D=size[2], dropout=dropout, n_classes=2
+            )  # Two for primary/secondary
+        else:
+            attention_net = Attn_Net(L=size[1], D=size[2], dropout=dropout, n_classes=2)
+        fc.append(attention_net)
+        self.attention_net = nn.Sequential(*fc)
+
+        # Separate regressors for primary and secondary patterns
+        self.primary_regressor = nn.Linear(size[1], 1)
+        self.secondary_regressor = nn.Linear(size[1], 1)
+
+        instance_classifiers = [
+            nn.Linear(size[1], 2) for i in range(2)
+        ]  # For pattern detection
+        self.instance_classifiers = nn.ModuleList(instance_classifiers)
+        self.k_sample = k_sample
+        self.instance_loss_fn = instance_loss_fn
+        self.n_classes = n_classes
+        self.subtyping = subtyping
+
+    def forward(
+        self,
+        h,
+        label=None,
+        instance_eval=False,
+        return_features=False,
+        attention_only=False,
+    ):
+        A, h = self.attention_net(h)  # NxK
+        A = torch.transpose(A, 1, 0)  # KxN
+        if attention_only:
+            return A
+        A_raw = A
+        A = F.softmax(A, dim=1)  # softmax over N
+
+        if instance_eval:
+            total_inst_loss = 0.0
+            all_preds = []
+            all_targets = []
+
+            if label is not None:
+                primary_label, secondary_label = extract_pattern_labels(label)
+
+                # Create tensor from Python scalars
+                inst_labels = torch.tensor(
+                    [primary_label, secondary_label], device=h.device
+                )
+
+                for i in range(len(self.instance_classifiers)):
+                    inst_label = inst_labels[i].item()
+                    classifier = self.instance_classifiers[i]
+
+                    # ALWAYS compute instance loss, regardless of pattern prominence
+                    if inst_label == 1:  # Pattern present
+                        instance_loss, preds, targets = self.inst_eval(A, h, classifier)
+                    else:  # Pattern not prominent - still compute but with different strategy
+                        # Use negative sampling or alternative approach
+                        instance_loss, preds, targets = self.inst_eval_out(
+                            A, h, classifier
+                        )
+
+                    all_preds.extend(preds.cpu().numpy())
+                    all_targets.extend(targets.cpu().numpy())
+                    total_inst_loss += instance_loss
+
+                # Average the loss
+                total_inst_loss /= len(self.instance_classifiers)
+
+        # Multi-branch: use separate attention for primary and secondary
+        M_primary = torch.mm(A[0:1], h)  # Use first attention head for primary
+        M_secondary = torch.mm(A[1:2], h)  # Use second attention head for secondary
+
+        # Get predictions
+        primary_logit = self.primary_regressor(M_primary)
+        secondary_logit = self.secondary_regressor(M_secondary)
+
+        # Combine into final output
+        pattern_logits = torch.cat([primary_logit, secondary_logit], dim=1)
+
+        # Apply constraints and scaling
+        primary = pattern_logits[0, 0]
+        secondary = pattern_logits[0, 1]
+
+        constraint_loss = None
+        if self.training:
+            diff = secondary - primary
+            constraint_loss = F.relu(diff)
+        else:
+            if secondary > primary:
+                pattern_logits[0, 0], pattern_logits[0, 1] = (
+                    pattern_logits[0, 1],
+                    pattern_logits[0, 0],
+                )
+
+        pattern_probs = torch.sigmoid(pattern_logits) * 2 + 3  # Scale to [3,5] range
+
+        if instance_eval:
+            results_dict = {
+                "instance_loss": total_inst_loss,
+                "inst_labels": np.array(all_targets),
+                "inst_preds": np.array(all_preds),
+            }
+            if constraint_loss is not None:
+                results_dict["constraint_loss"] = constraint_loss
+        else:
+            results_dict = {}
+        if return_features:
+            results_dict.update(
+                {"features_primary": M_primary, "features_secondary": M_secondary}
+            )
+
+        return pattern_logits, pattern_probs, pattern_probs, A_raw, results_dict
+
+
+def extract_pattern_labels(label):
+    """Extract primary and secondary pattern labels from various label formats"""
+    if label is None:
+        return None, None
+
+    # Handle different label formats
+    if isinstance(label, torch.Tensor):
+        if label.numel() == 1:
+            # Single value
+            primary_value = label.item()
+            secondary_value = primary_value
+        else:
+            # Multiple values - handle different tensor shapes
+            label_flat = label.flatten()
+            if len(label_flat) >= 2:
+                primary_value = label_flat[0].item()
+                secondary_value = label_flat[1].item()
+            else:
+                primary_value = label_flat[0].item()
+                secondary_value = primary_value
+    elif isinstance(label, (list, tuple)):
+        # List or tuple format
+        primary_value = float(label[0])
+        secondary_value = float(label[1]) if len(label) > 1 else primary_value
+    else:
+        # Single scalar value
+        primary_value = float(label)
+        secondary_value = primary_value
+
+    # Convert to binary labels for pattern detection
+    primary_label = 1 if primary_value >= 3 else 0
+    secondary_label = 1 if secondary_value >= 3 else 0
+
+    return primary_label, secondary_label

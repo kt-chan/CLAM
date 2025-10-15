@@ -530,7 +530,13 @@ def create_parser() -> argparse.ArgumentParser:
         "--split", type=str, choices=["train", "val", "test", "all"], default="test"
     )
     parser.add_argument(
-        "--task", type=str, choices=["task_1_tumor_vs_normal", "task_2_tumor_subtyping"]
+        "--task",
+        type=str,
+        choices=[
+            "task_1_tumor_vs_normal",
+            "task_2_tumor_subtyping",
+            "task_3_tumor_count",
+        ],
     )
 
     # MLflow model registration options

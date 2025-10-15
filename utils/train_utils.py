@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import os
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, Optional, Tuple, TypedDict, Union
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 from sklearn.metrics import auc as calc_auc
-from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.metrics import (
+    roc_auc_score,
+    roc_curve,
+    mean_absolute_error,
+    mean_squared_error,
+)
 from sklearn.preprocessing import label_binarize
 
 import mlflow
@@ -17,10 +24,17 @@ import mlflow.pytorch
 from mlflow.models.signature import infer_signature
 
 from dataset_modules.dataset_generic import Generic_MIL_Dataset, save_splits
-from models.model_clam import CLAM_MB, CLAM_SB
+from models.model_clam import CLAM_MB, CLAM_SB, CLAM_MB_Regression, CLAM_SB_Regression
 from models.model_mil import MIL_fc, MIL_fc_mc
 from utils.file_utils import save_pkl
-from utils.utils import calculate_error, get_optim, get_split_loader, seed_torch
+from utils.utils import (
+    calculate_error,
+    get_optim,
+    get_split_loader,
+    seed_torch,
+    TaskType,
+)
+from utils.utils import TaskType
 
 # Device configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -88,6 +102,299 @@ class MILModelConfig(TypedDict, total=False):
     k_sample: int
 
 
+# ==================== UPDATED METRICS LOGGER CLASSES ====================
+class BaseMetricsLogger(ABC):
+    """Base class for metrics loggers"""
+
+    def __init__(self, task_type: TaskType):
+        self.task_type = task_type
+        self.initialize()
+
+    @abstractmethod
+    def initialize(self) -> None:
+        """Reset all counters and metrics"""
+        pass
+
+    @abstractmethod
+    def log(
+        self, Y_hat: Union[int, float, torch.Tensor], Y: Union[int, float, torch.Tensor]
+    ) -> None:
+        """Log single prediction"""
+        pass
+
+    @abstractmethod
+    def log_batch(
+        self, Y_hat: Union[np.ndarray, torch.Tensor], Y: Union[np.ndarray, torch.Tensor]
+    ) -> None:
+        """Log batch of predictions"""
+        pass
+
+    @abstractmethod
+    def get_summary(self, c: Optional[int] = None) -> Tuple[Optional[float], int, int]:
+        """Get metrics summary"""
+        pass
+
+    @abstractmethod
+    def get_all_metrics(self) -> Dict[str, float]:
+        """Get all computed metrics as dictionary"""
+        pass
+
+
+class ClassificationMetricsLogger(BaseMetricsLogger):
+    """Metrics logger for classification tasks (backward compatible with original AccuracyLogger)"""
+
+    def __init__(self, n_classes: int, task_type: TaskType = TaskType.BINARY):
+        self.n_classes = n_classes
+        super().__init__(task_type)
+
+    def initialize(self) -> None:
+        """Reset all counters"""
+        self.data = [{"count": 0, "correct": 0} for _ in range(self.n_classes)]
+
+    def log(self, Y_hat: Union[int, torch.Tensor], Y: Union[int, torch.Tensor]) -> None:
+        """Log single prediction"""
+        # Detach tensors from computation graph before conversion
+        if isinstance(Y_hat, torch.Tensor):
+            Y_hat = (
+                Y_hat.detach().item()
+                if Y_hat.dim() == 0
+                else int(Y_hat.detach().cpu().numpy())
+            )
+        if isinstance(Y, torch.Tensor):
+            Y = Y.detach().item() if Y.dim() == 0 else int(Y.detach().cpu().numpy())
+
+        Y_hat = int(Y_hat)
+        Y = int(Y)
+        self.data[Y]["count"] += 1
+        self.data[Y]["correct"] += Y_hat == Y
+
+    def log_batch(
+        self, Y_hat: Union[np.ndarray, torch.Tensor], Y: Union[np.ndarray, torch.Tensor]
+    ) -> None:
+        """Log batch of predictions"""
+        if isinstance(Y_hat, torch.Tensor):
+            Y_hat = Y_hat.detach().cpu().numpy()
+        if isinstance(Y, torch.Tensor):
+            Y = Y.detach().cpu().numpy()
+
+        Y_hat = np.array(Y_hat).astype(int)
+        Y = np.array(Y).astype(int)
+        for label_class in np.unique(Y):
+            cls_mask = Y == label_class
+            self.data[label_class]["count"] += cls_mask.sum()
+            self.data[label_class]["correct"] += (Y_hat[cls_mask] == Y[cls_mask]).sum()
+
+    def get_summary(self, c: Optional[int] = None) -> Tuple[Optional[float], int, int]:
+        """
+        Get accuracy summary for class c
+
+        Args:
+            c: Class index. If None, returns overall accuracy.
+
+        Returns:
+            Tuple of (accuracy, correct_count, total_count)
+        """
+        if c is not None:
+            count = self.data[c]["count"]
+            correct = self.data[c]["correct"]
+            acc = float(correct) / count if count > 0 else None
+            return acc, correct, count
+        else:
+            # Return overall accuracy
+            total_count = sum(item["count"] for item in self.data)
+            total_correct = sum(item["correct"] for item in self.data)
+            acc = float(total_correct) / total_count if total_count > 0 else None
+            return acc, total_correct, total_count
+
+    def get_all_metrics(self) -> Dict[str, float]:
+        """Get all computed metrics as dictionary"""
+        metrics = {}
+        total_count = sum(item["count"] for item in self.data)
+        total_correct = sum(item["correct"] for item in self.data)
+
+        if total_count > 0:
+            metrics["overall_accuracy"] = float(total_correct) / total_count
+
+        for i in range(self.n_classes):
+            acc, correct, count = self.get_summary(i)
+            if acc is not None:
+                metrics[f"class_{i}_accuracy"] = acc
+                metrics[f"class_{i}_count"] = count
+
+        return metrics
+
+
+class RegressionMetricsLogger(BaseMetricsLogger):
+    """Metrics logger for regression tasks with support for multi-output regression"""
+
+    def __init__(self, task_type: TaskType = TaskType.REGRESSION):
+        super().__init__(task_type)
+
+    def initialize(self) -> None:
+        """Reset all metrics"""
+        self.predictions = []
+        self.targets = []
+        self.total_count = 0
+
+    def log(
+        self,
+        Y_hat: Union[float, torch.Tensor, np.ndarray],
+        Y: Union[float, torch.Tensor, np.ndarray],
+    ) -> None:
+        """Log single prediction - handle multi-output regression"""
+        # Convert tensors to numpy arrays, detaching from computation graph if needed
+        if isinstance(Y_hat, torch.Tensor):
+            Y_hat = Y_hat.detach().cpu().numpy()
+        if isinstance(Y, torch.Tensor):
+            Y = Y.detach().cpu().numpy()
+
+        # Ensure we're working with numpy arrays
+        Y_hat = np.asarray(Y_hat)
+        Y = np.asarray(Y)
+
+        # Handle multi-output case (like [M_primary, M_secondary])
+        if Y_hat.ndim == 1 and Y_hat.size > 1:
+            # This is a multi-output prediction for a single sample
+            # We'll flatten it and treat each output as a separate prediction
+            for i in range(Y_hat.size):
+                self.predictions.append(float(Y_hat[i]))
+                self.targets.append(float(Y[i]))
+                self.total_count += 1
+        else:
+            # Single output or already flattened
+            # Flatten any multi-dimensional arrays
+            Y_hat_flat = Y_hat.flatten()
+            Y_flat = Y.flatten()
+
+            for pred, target in zip(Y_hat_flat, Y_flat):
+                self.predictions.append(float(pred))
+                self.targets.append(float(target))
+                self.total_count += 1
+
+    def log_batch(
+        self, Y_hat: Union[np.ndarray, torch.Tensor], Y: Union[np.ndarray, torch.Tensor]
+    ) -> None:
+        """Log batch of predictions - handle multi-output regression"""
+        if isinstance(Y_hat, torch.Tensor):
+            Y_hat = Y_hat.detach().cpu().numpy()
+        if isinstance(Y, torch.Tensor):
+            Y = Y.detach().cpu().numpy()
+
+        # Ensure we're working with numpy arrays
+        Y_hat = np.asarray(Y_hat)
+        Y = np.asarray(Y)
+
+        # Handle different dimensionalities
+        if Y_hat.ndim == 1:
+            # Single output, single sample or batch of single outputs
+            Y_hat_flat = Y_hat.flatten()
+            Y_flat = Y.flatten()
+        elif Y_hat.ndim == 2:
+            if Y_hat.shape[1] == 1:
+                # Batch of single outputs: (batch_size, 1)
+                Y_hat_flat = Y_hat.flatten()
+                Y_flat = Y.flatten()
+            else:
+                # Multi-output regression: (batch_size, n_outputs)
+                # We'll flatten all outputs together
+                Y_hat_flat = Y_hat.reshape(-1)
+                Y_flat = Y.reshape(-1)
+        else:
+            # Higher dimensions - flatten completely
+            Y_hat_flat = Y_hat.reshape(-1)
+            Y_flat = Y.reshape(-1)
+
+        # Add all predictions and targets
+        self.predictions.extend(Y_hat_flat.astype(float).tolist())
+        self.targets.extend(Y_flat.astype(float).tolist())
+        self.total_count += len(Y_hat_flat)
+
+    def get_summary(self, c: Optional[int] = None) -> Tuple[Optional[float], int, int]:
+        """
+        Get regression metrics summary
+
+        Args:
+            c: If provided, returns metrics for specific output index in multi-output case
+
+        Returns:
+            Tuple of (MAE, total_count, total_count)
+        """
+        if self.total_count == 0:
+            return None, 0, 0
+
+        if c is not None:
+            # For multi-output case, filter predictions and targets for specific output
+            # This assumes predictions are stored as [output1_sample1, output2_sample1, output1_sample2, output2_sample2, ...]
+            # We need to know the number of outputs to do this properly
+            # For now, return overall MAE
+            pass
+
+        mae = mean_absolute_error(self.targets, self.predictions)
+        return mae, self.total_count, self.total_count
+
+    def get_all_metrics(self) -> Dict[str, float]:
+        """Get all computed regression metrics as dictionary"""
+        if self.total_count == 0:
+            return {}
+
+        # Ensure targets and predictions are NumPy arrays for calculation
+        targets_np = np.array(self.targets)
+        predictions_np = np.array(self.predictions)
+
+        metrics = {
+            "mae": mean_absolute_error(targets_np, predictions_np),
+            "mse": mean_squared_error(targets_np, predictions_np),
+            "rmse": np.sqrt(mean_squared_error(targets_np, predictions_np)),
+            "total_count": self.total_count,
+        }
+
+        # Additional regression metrics
+        if self.total_count > 1:
+            # R2 calculation denominator (Total Sum of Squares: SStotal)
+            ss_total = np.sum((targets_np - np.mean(targets_np)) ** 2)
+
+            # Fix for divided by zero: check if the denominator is zero
+            if ss_total == 0:
+                # If targets are all the same, R2 is typically 1.0 if predictions match
+                # and the model is trivial, or excluded/set to 0.0.
+                # Here we set it to 1.0 only if the model is perfect (i.e., MSE is 0)
+                # otherwise we might set it to 0 or nan. Given the context, 1.0 is safest
+                # if the constant prediction is the target.
+
+                # Check if the model also predicted the constant value perfectly
+                if np.sum((targets_np - predictions_np) ** 2) == 0:
+                    metrics["r2"] = 1.0
+                else:
+                    # If the data is constant, but the predictions are wrong
+                    # R2 is often considered undefined or 0.0, or handled by the caller.
+                    # We will set it to 0.0 (as the simple model of predicting the mean
+                    # performs better than our model).
+                    metrics["r2"] = 0.0
+            else:
+                # Numerator (Residual Sum of Squares: SSres)
+                ss_residual = np.sum((targets_np - predictions_np) ** 2)
+
+                metrics["r2"] = 1.0 - (ss_residual / ss_total)
+
+        return metrics
+
+
+class MetricsLoggerFactory:
+    """Factory for creating appropriate metrics logger based on task type"""
+
+    @staticmethod
+    def create_logger(task_type: TaskType, n_classes: int = -1) -> BaseMetricsLogger:
+        """Create appropriate metrics logger based on task type"""
+        if task_type == TaskType.REGRESSION:
+            return RegressionMetricsLogger(task_type)
+        else:  # BINARY or MULTICLASS
+            if n_classes <= 0:
+                raise ValueError(
+                    f"n_classes must be positive for classification, got {n_classes}"
+                )
+            return ClassificationMetricsLogger(n_classes, task_type)
+
+
 # ==================== CORE CONFIGURATION CLASS ====================
 class MILTrainingConfig:
     """Configuration class for MIL training with strong typing"""
@@ -116,7 +423,7 @@ class MILTrainingConfig:
         # Model parameters
         self.model_type: str = kwargs.get("model_type", "clam_sb")
         self.model_size: str = kwargs.get("model_size", "small")
-        self.task: Optional[str] = kwargs.get("task")
+        self.task = kwargs.get("task")
 
         # CLAM specific parameters
         self.no_inst_cluster: bool = kwargs.get("no_inst_cluster", False)
@@ -148,9 +455,14 @@ class MILTrainingConfig:
 
         # Set n_classes based on task
         if self.task == "task_1_tumor_vs_normal":
+            self.task: TaskType = TaskType.BINARY
             self.n_classes = 2
         elif self.task == "task_2_tumor_subtyping":
+            self.task: TaskType = TaskType.MULTICLASS
             self.n_classes = 3
+        elif self.task == "task_3_tumor_count":
+            self.task: TaskType = TaskType.REGRESSION
+            self.n_classes = -1
         else:
             self.n_classes = None
 
@@ -214,46 +526,6 @@ class MILTrainingConfig:
 
 
 # ==================== UTILITY CLASSES ====================
-class AccuracyLogger:
-    """Accuracy logger for tracking classification performance per class"""
-
-    def __init__(self, n_classes: int) -> None:
-        self.n_classes = n_classes
-        self.initialize()
-
-    def initialize(self) -> None:
-        """Reset all counters"""
-        self.data = [{"count": 0, "correct": 0} for _ in range(self.n_classes)]
-
-    def log(self, Y_hat: int, Y: int) -> None:
-        """Log single prediction"""
-        Y_hat = int(Y_hat)
-        Y = int(Y)
-        self.data[Y]["count"] += 1
-        self.data[Y]["correct"] += Y_hat == Y
-
-    def log_batch(self, Y_hat: np.ndarray, Y: np.ndarray) -> None:
-        """Log batch of predictions"""
-        Y_hat = np.array(Y_hat).astype(int)
-        Y = np.array(Y).astype(int)
-        for label_class in np.unique(Y):
-            cls_mask = Y == label_class
-            self.data[label_class]["count"] += cls_mask.sum()
-            self.data[label_class]["correct"] += (Y_hat[cls_mask] == Y[cls_mask]).sum()
-
-    def get_summary(self, c: int) -> Tuple[Optional[float], int, int]:
-        """
-        Get accuracy summary for class c
-
-        Returns:
-            Tuple of (accuracy, correct_count, total_count)
-        """
-        count = self.data[c]["count"]
-        correct = self.data[c]["correct"]
-        acc = float(correct) / count if count > 0 else None
-        return acc, correct, count
-
-
 class EarlyStopping:
     """Early stops training if validation loss doesn't improve after given patience"""
 
@@ -302,34 +574,233 @@ class EarlyStopping:
         self.val_loss_min = val_loss
 
 
+# ==================== UPDATED METRICS CALCULATOR ====================
+class MetricsCalculator:
+    """Utility class for calculating and logging metrics"""
+
+    @staticmethod
+    def calculate_classification_metrics(
+        n_classes: int, labels: np.ndarray, probabilities: np.ndarray
+    ) -> Dict[str, float]:
+        """Calculate classification metrics (AUC, etc.)"""
+        metrics = {}
+
+        if n_classes == 2:
+            metrics["auc"] = roc_auc_score(labels, probabilities[:, 1])
+        else:
+            aucs = []
+            binary_labels = label_binarize(labels, classes=list(range(n_classes)))
+            for class_idx in range(n_classes):
+                if class_idx in labels:
+                    fpr, tpr, _ = roc_curve(
+                        binary_labels[:, class_idx], probabilities[:, class_idx]
+                    )
+                    aucs.append(calc_auc(fpr, tpr))
+                else:
+                    aucs.append(float("nan"))
+            metrics["auc"] = np.nanmean(np.array(aucs))
+
+        return metrics
+
+    @staticmethod
+    def calculate_regression_metrics(
+        labels: np.ndarray, predictions: np.ndarray
+    ) -> Dict[str, float]:
+        """Calculate regression metrics"""
+        metrics = {
+            "mae": mean_absolute_error(labels, predictions),
+            "mse": mean_squared_error(labels, predictions),
+            "rmse": np.sqrt(mean_squared_error(labels, predictions)),
+        }
+
+        # Calculate R-squared
+        if len(labels) > 1:
+            ss_res = np.sum((labels - predictions) ** 2)
+            ss_tot = np.sum((labels - np.mean(labels)) ** 2)
+            metrics["r2"] = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0.0
+
+        return metrics
+
+    @staticmethod
+    def log_training_metrics(
+        epoch: int,
+        train_loss: float,
+        train_error: float,
+        train_inst_loss: float,
+        train_constraint_loss: float,
+        metrics_logger: BaseMetricsLogger,
+        n_classes: int,
+        writer: Optional[Any] = None,
+    ) -> None:
+        """Log training metrics to MLflow and TensorBoard"""
+        mlflow.log_metric("train_loss", train_loss, step=epoch)
+        mlflow.log_metric("train_error", train_error, step=epoch)
+
+        if train_inst_loss > 0:  # Only log if instance loss is used
+            mlflow.log_metric("train_clustering_loss", train_inst_loss, step=epoch)
+
+        if train_constraint_loss > 0:  # Only log if instance loss is used
+            mlflow.log_metric(
+                "train_constraint_loss", train_constraint_loss, step=epoch
+            )
+
+        # Log task-specific metrics
+        all_metrics = metrics_logger.get_all_metrics()
+        for metric_name, metric_value in all_metrics.items():
+            mlflow.log_metric(f"train_{metric_name}", metric_value, step=epoch)
+            if writer:
+                writer.add_scalar(f"train/{metric_name}", metric_value, epoch)
+
+        # For classification, also log per-class accuracy (backward compatibility)
+        if isinstance(metrics_logger, ClassificationMetricsLogger):
+            for i in range(n_classes):
+                acc, correct, count = metrics_logger.get_summary(i)
+                if acc is not None:
+                    mlflow.log_metric(f"train_class_{i}_acc", acc, step=epoch)
+                    if writer:
+                        writer.add_scalar(f"train/class_{i}_acc", acc, epoch)
+
+        if writer:
+            writer.add_scalar("train/loss", train_loss, epoch)
+            writer.add_scalar("train/error", train_error, epoch)
+            if train_inst_loss > 0:
+                writer.add_scalar("train/clustering_loss", train_inst_loss, epoch)
+
+    @staticmethod
+    def log_validation_metrics(
+        epoch: int,
+        val_loss: float,
+        val_error: float,
+        auc: Optional[float],
+        metrics_logger: BaseMetricsLogger,
+        n_classes: int,
+        writer: Optional[Any] = None,
+        task_type: TaskType = TaskType.BINARY,
+    ) -> None:
+        """Log validation metrics to MLflow and TensorBoard"""
+        mlflow.log_metric("val_loss", val_loss, step=epoch)
+        mlflow.log_metric("val_error", val_error, step=epoch)
+
+        if auc is not None and task_type != TaskType.REGRESSION:
+            mlflow.log_metric("val_auc", auc, step=epoch)
+
+        # Log task-specific metrics
+        all_metrics = metrics_logger.get_all_metrics()
+        for metric_name, metric_value in all_metrics.items():
+            mlflow.log_metric(f"val_{metric_name}", metric_value, step=epoch)
+            if writer:
+                writer.add_scalar(f"val/{metric_name}", metric_value, epoch)
+
+        # For classification, also log per-class accuracy (backward compatibility)
+        if isinstance(metrics_logger, ClassificationMetricsLogger):
+            for i in range(n_classes):
+                acc, correct, count = metrics_logger.get_summary(i)
+                if acc is not None:
+                    mlflow.log_metric(f"val_class_{i}_acc", acc, step=epoch)
+                    if writer:
+                        writer.add_scalar(f"val/class_{i}_acc", acc, epoch)
+
+        if writer:
+            writer.add_scalar("val/loss", val_loss, epoch)
+            if auc is not None:
+                writer.add_scalar("val/auc", auc, epoch)
+            writer.add_scalar("val/error", val_error, epoch)
+
+    @staticmethod
+    def log_final_metrics(
+        val_error: float,
+        val_auc: Optional[float],
+        test_error: float,
+        test_auc: Optional[float],
+        metrics_logger: BaseMetricsLogger,
+        n_classes: int,
+        task_type: TaskType = TaskType.BINARY,
+    ) -> None:
+        """Log final metrics to MLflow"""
+        mlflow.log_metric("final_val_loss", val_error)
+        mlflow.log_metric("final_test_loss", test_error)
+
+        if val_auc is not None and task_type != TaskType.REGRESSION:
+            mlflow.log_metric("final_val_auc", val_auc)
+        if test_auc is not None and task_type != TaskType.REGRESSION:
+            mlflow.log_metric("final_test_auc", test_auc)
+
+        if task_type != TaskType.REGRESSION:
+            mlflow.log_metric("final_val_acc", 1 - val_error)
+            mlflow.log_metric("final_test_acc", 1 - test_error)
+
+        # Log task-specific final metrics
+        all_metrics = metrics_logger.get_all_metrics()
+        for metric_name, metric_value in all_metrics.items():
+            mlflow.log_metric(f"final_test_{metric_name}", metric_value)
+
+        # For classification, also log per-class accuracy (backward compatibility)
+        if isinstance(metrics_logger, ClassificationMetricsLogger):
+            for i in range(n_classes):
+                acc, correct, count = metrics_logger.get_summary(i)
+                if acc is not None:
+                    mlflow.log_metric(f"final_test_class_{i}_acc", acc)
+
+
+# ==================== FACTORY CLASSES ====================
 # ==================== FACTORY CLASSES ====================
 class ModelFactory:
     """Factory class for creating models and loss functions"""
 
     @staticmethod
-    def create_loss_function(bag_loss: str, n_classes: int) -> nn.Module:
-        """Create loss function based on configuration"""
-        if bag_loss == "svm":
-            from topk.svm import SmoothTop1SVM
-
-            loss_fn = SmoothTop1SVM(n_classes=n_classes)
-            if device.type == "cuda":
-                loss_fn = loss_fn.cuda()
+    def create_loss_function(
+        bag_loss: str, n_classes: int, task: TaskType
+    ) -> nn.Module:
+        """Create loss function based on configuration and task type"""
+        if task == TaskType.REGRESSION:
+            # Regression-specific loss functions
+            if bag_loss == "mse":
+                loss_fn = nn.MSELoss()
+            elif bag_loss == "l1":
+                loss_fn = nn.L1Loss()
+            elif bag_loss == "smooth_l1":
+                loss_fn = nn.SmoothL1Loss()
+            elif bag_loss == "huber":
+                loss_fn = nn.HuberLoss()
+            else:
+                # Default to MSE for regression
+                loss_fn = nn.MSELoss()
+                print(f"Using default MSE loss for regression (requested: {bag_loss})")
         else:
-            loss_fn = nn.CrossEntropyLoss()
+            # Classification loss functions
+            if bag_loss == "svm":
+                from topk.svm import SmoothTop1SVM
+
+                loss_fn = SmoothTop1SVM(n_classes=n_classes)
+                if device.type == "cuda":
+                    loss_fn = loss_fn.cuda()
+            else:
+                loss_fn = nn.CrossEntropyLoss()
         return loss_fn
 
     @staticmethod
-    def create_instance_loss(inst_loss: Optional[str]) -> nn.Module:
+    def create_instance_loss(inst_loss: Optional[str], task: TaskType) -> nn.Module:
         """Create instance loss function for CLAM models"""
-        if inst_loss == "svm":
-            from topk.svm import SmoothTop1SVM
+        if task == TaskType.REGRESSION:
+            # For regression, instance loss is still classification-based (pattern detection)
+            if inst_loss == "svm":
+                from topk.svm import SmoothTop1SVM
 
-            instance_loss_fn = SmoothTop1SVM(n_classes=2)
-            if device.type == "cuda":
-                instance_loss_fn = instance_loss_fn.cuda()
+                instance_loss_fn = SmoothTop1SVM(n_classes=2)
+                if device.type == "cuda":
+                    instance_loss_fn = instance_loss_fn.cuda()
+            else:
+                instance_loss_fn = nn.CrossEntropyLoss()
         else:
-            instance_loss_fn = nn.CrossEntropyLoss()
+            # Classification task
+            if inst_loss == "svm":
+                from topk.svm import SmoothTop1SVM
+
+                instance_loss_fn = SmoothTop1SVM(n_classes=2)
+                if device.type == "cuda":
+                    instance_loss_fn = instance_loss_fn.cuda()
+            else:
+                instance_loss_fn = nn.CrossEntropyLoss()
         return instance_loss_fn
 
     @staticmethod
@@ -348,7 +819,7 @@ class ModelFactory:
             model_dict["size_arg"] = config.model_size
 
         # Create appropriate model
-        if config.model_type in ["clam_sb", "clam_mb"]:
+        if config.model_type in ["clam_sb", "clam_mb", "clam_sbr", "clam_mbr"]:
             model = ModelFactory._create_clam_model(config, model_dict)
         else:  # MIL model
             model = ModelFactory._create_mil_model(config, model_dict)
@@ -366,12 +837,24 @@ class ModelFactory:
         if config.B > 0:
             model_dict["k_sample"] = config.B
 
-        instance_loss_fn = ModelFactory.create_instance_loss(config.inst_loss)
+        instance_loss_fn = ModelFactory.create_instance_loss(
+            config.inst_loss, config.task
+        )
 
-        if config.model_type == "clam_sb":
-            return CLAM_SB(**model_dict, instance_loss_fn=instance_loss_fn)
-        elif config.model_type == "clam_mb":
-            return CLAM_MB(**model_dict, instance_loss_fn=instance_loss_fn)
+        if config.task == TaskType.BINARY or config.task == TaskType.MULTICLASS:
+            if config.model_type == "clam_sb":
+                return CLAM_SB(**model_dict, instance_loss_fn=instance_loss_fn)
+            elif config.model_type == "clam_mb":
+                return CLAM_MB(**model_dict, instance_loss_fn=instance_loss_fn)
+        elif config.task == TaskType.REGRESSION:
+            if config.model_type == "clam_sb" or config.model_type == "clam_sbr":
+                return CLAM_SB_Regression(
+                    **model_dict, instance_loss_fn=instance_loss_fn
+                )
+            elif config.model_type == "clam_mb" or config.model_type == "clam_mbr":
+                return CLAM_MB_Regression(
+                    **model_dict, instance_loss_fn=instance_loss_fn
+                )
         else:
             raise NotImplementedError(f"Model type {config.model_type} not implemented")
 
@@ -380,10 +863,25 @@ class ModelFactory:
         config: MILTrainingConfig, model_dict: MILModelConfig
     ) -> nn.Module:
         """Create MIL model"""
-        if config.n_classes > 2:
-            return MIL_fc_mc(**model_dict)
+        if config.task == TaskType.REGRESSION:
+            # For regression MIL models
+            if hasattr(config, "regression_outputs"):
+                output_dim = config.regression_outputs
+            else:
+                output_dim = 1  # Default to single output regression
+
+            if config.n_classes > 2:
+                # Multi-output regression
+                return MIL_fc_mc(**model_dict)
+            else:
+                # Single output regression
+                return MIL_fc(**model_dict)
         else:
-            return MIL_fc(**model_dict)
+            # Classification MIL models
+            if config.n_classes > 2:
+                return MIL_fc_mc(**model_dict)
+            else:
+                return MIL_fc(**model_dict)
 
 
 class DataLoaderFactory:
@@ -394,119 +892,40 @@ class DataLoaderFactory:
         config: MILTrainingConfig, train_split: Any, val_split: Any, test_split: Any
     ) -> Tuple[Any, Any, Any]:
         """Create data loaders for training, validation, and testing"""
+
+        print(f"Creating data loaders for task: {config.task}")
+
         train_loader = get_split_loader(
             train_split,
             training=True,
             testing=config.testing,
             weighted=config.weighted_sample,
+            task=config.task,
         )
-        val_loader = get_split_loader(val_split, testing=config.testing)
-        test_loader = get_split_loader(test_split, testing=config.testing)
+        val_loader = get_split_loader(
+            val_split, testing=config.testing, task=config.task
+        )
+        test_loader = get_split_loader(
+            test_split, testing=config.testing, task=config.task
+        )
         return train_loader, val_loader, test_loader
 
-
-# ==================== METRICS AND LOGGING ====================
-class MetricsCalculator:
-    """Utility class for calculating and logging metrics"""
-
     @staticmethod
-    def calculate_auc(
-        n_classes: int, labels: np.ndarray, probabilities: np.ndarray
-    ) -> float:
-        """Calculate AUC score based on number of classes"""
-        if n_classes == 2:
-            return roc_auc_score(labels, probabilities[:, 1])
-        else:
-            aucs = []
-            binary_labels = label_binarize(labels, classes=list(range(n_classes)))
-            for class_idx in range(n_classes):
-                if class_idx in labels:
-                    fpr, tpr, _ = roc_curve(
-                        binary_labels[:, class_idx], probabilities[:, class_idx]
-                    )
-                    aucs.append(calc_auc(fpr, tpr))
-                else:
-                    aucs.append(float("nan"))
-            return np.nanmean(np.array(aucs))
-
-    @staticmethod
-    def log_training_metrics(
-        epoch: int,
-        train_loss: float,
-        train_error: float,
-        train_inst_loss: float,
-        acc_logger: AccuracyLogger,
-        n_classes: int,
-        writer: Optional[Any] = None,
-    ) -> None:
-        """Log training metrics to MLflow and TensorBoard"""
-        mlflow.log_metric("train_loss", train_loss, step=epoch)
-        mlflow.log_metric("train_error", train_error, step=epoch)
-        mlflow.log_metric("train_clustering_loss", train_inst_loss, step=epoch)
-
-        for i in range(n_classes):
-            acc, correct, count = acc_logger.get_summary(i)
-            print(f"class {i}: acc {acc}, correct {correct}/{count}")
-            if writer and acc is not None:
-                writer.add_scalar(f"train/class_{i}_acc", acc, epoch)
-            if acc is not None:
-                mlflow.log_metric(f"train_class_{i}_acc", acc, step=epoch)
-
-        if writer:
-            writer.add_scalar("train/loss", train_loss, epoch)
-            writer.add_scalar("train/error", train_error, epoch)
-            writer.add_scalar("train/clustering_loss", train_inst_loss, epoch)
-
-    @staticmethod
-    def log_validation_metrics(
-        epoch: int,
-        val_loss: float,
-        val_error: float,
-        auc: float,
-        acc_logger: AccuracyLogger,
-        n_classes: int,
-        writer: Optional[Any] = None,
-    ) -> None:
-        """Log validation metrics to MLflow and TensorBoard"""
-        mlflow.log_metric("val_loss", val_loss, step=epoch)
-        mlflow.log_metric("val_error", val_error, step=epoch)
-        mlflow.log_metric("val_auc", auc, step=epoch)
-
-        for i in range(n_classes):
-            acc, correct, count = acc_logger.get_summary(i)
-            print(f"class {i}: acc {acc}, correct {correct}/{count}")
-            if writer and acc is not None:
-                writer.add_scalar(f"val/class_{i}_acc", acc, epoch)
-            if acc is not None:
-                mlflow.log_metric(f"val_class_{i}_acc", acc, step=epoch)
-
-        if writer:
-            writer.add_scalar("val/loss", val_loss, epoch)
-            writer.add_scalar("val/auc", auc, epoch)
-            writer.add_scalar("val/error", val_error, epoch)
-
-    @staticmethod
-    def log_final_metrics(
-        val_error: float,
-        val_auc: float,
-        test_error: float,
-        test_auc: float,
-        acc_logger: AccuracyLogger,
-        n_classes: int,
-    ) -> None:
-        """Log final metrics to MLflow"""
-        mlflow.log_metric("final_val_loss", val_error)
-        mlflow.log_metric("final_val_auc", val_auc)
-        mlflow.log_metric("final_test_loss", test_error)
-        mlflow.log_metric("final_test_auc", test_auc)
-        mlflow.log_metric("final_val_acc", 1 - val_error)
-        mlflow.log_metric("final_test_acc", 1 - test_error)
-
-        for i in range(n_classes):
-            acc, correct, count = acc_logger.get_summary(i)
-            print(f"class {i}: acc {acc}, correct {correct}/{count}")
-            if acc is not None:
-                mlflow.log_metric(f"final_test_class_{i}_acc", acc)
+    def create_loader_for_split(
+        config: MILTrainingConfig,
+        split_dataset: Any,
+        training: bool = False,
+        testing: bool = False,
+        weighted: bool = False,
+    ) -> Any:
+        """Create a data loader for a specific split using task from config"""
+        return get_split_loader(
+            split_dataset,
+            training=training,
+            testing=testing,
+            weighted=weighted,
+            task=config.task,
+        )
 
 
 # ==================== ABSTRACT TRAINING STRATEGIES ====================
@@ -520,6 +939,7 @@ class TrainingStrategy(ABC):
         model: nn.Module,
         loader: Any,
         optimizer: torch.optim.Optimizer,
+        task_type: TaskType,
         n_classes: int,
         writer: Optional[Any] = None,
         loss_fn: Optional[nn.Module] = None,
@@ -535,11 +955,13 @@ class TrainingStrategy(ABC):
         epoch: int,
         model: nn.Module,
         loader: Any,
+        task_type: TaskType,
         n_classes: int,
         early_stopping: Optional[EarlyStopping] = None,
         writer: Optional[Any] = None,
         loss_fn: Optional[nn.Module] = None,
         results_dir: Optional[str] = None,
+        **kwargs,
     ) -> bool:
         """Validate the model"""
         pass
@@ -554,6 +976,7 @@ class StandardMILTrainingStrategy(TrainingStrategy):
         model: nn.Module,
         loader: Any,
         optimizer: torch.optim.Optimizer,
+        task_type: TaskType,
         n_classes: int,
         writer: Optional[Any] = None,
         loss_fn: Optional[nn.Module] = None,
@@ -561,7 +984,8 @@ class StandardMILTrainingStrategy(TrainingStrategy):
     ) -> None:
         """Training loop for standard MIL models"""
         model.train()
-        acc_logger = AccuracyLogger(n_classes=n_classes)
+        task_type = kwargs.get("task_type", TaskType.BINARY)
+        metrics_logger = MetricsLoggerFactory.create_logger(task_type, n_classes)
         train_loss = 0.0
         train_error = 0.0
 
@@ -573,7 +997,7 @@ class StandardMILTrainingStrategy(TrainingStrategy):
             logits, Y_prob, Y_hat, _, _ = model(data)
 
             # Calculate loss
-            acc_logger.log(Y_hat, label)
+            metrics_logger.log(Y_hat, label)
             loss = (
                 loss_fn(logits, label)
                 if loss_fn
@@ -606,7 +1030,7 @@ class StandardMILTrainingStrategy(TrainingStrategy):
 
         # Log training metrics
         MetricsCalculator.log_training_metrics(
-            epoch, train_loss, train_error, 0.0, acc_logger, n_classes, writer
+            epoch, train_loss, train_error, 0.0, metrics_logger, n_classes, writer
         )
 
     def validate(
@@ -620,15 +1044,22 @@ class StandardMILTrainingStrategy(TrainingStrategy):
         writer: Optional[Any] = None,
         loss_fn: Optional[nn.Module] = None,
         results_dir: Optional[str] = None,
+        **kwargs,
     ) -> bool:
         """Validation loop for standard MIL models"""
         model.eval()
-        acc_logger = AccuracyLogger(n_classes=n_classes)
+        task_type = kwargs.get("task_type", TaskType.BINARY)
+        metrics_logger = MetricsLoggerFactory.create_logger(task_type, n_classes)
         val_loss = 0.0
         val_error = 0.0
 
-        probabilities = np.zeros((len(loader), n_classes))
+        probabilities = (
+            np.zeros((len(loader), n_classes))
+            if task_type != TaskType.REGRESSION
+            else np.zeros(len(loader))
+        )
         labels = np.zeros(len(loader))
+        predictions = np.zeros(len(loader))
 
         with torch.no_grad():
             for batch_idx, (data, label) in enumerate(loader):
@@ -638,14 +1069,21 @@ class StandardMILTrainingStrategy(TrainingStrategy):
 
                 logits, Y_prob, Y_hat, _, _ = model(data)
 
-                acc_logger.log(Y_hat, label)
+                metrics_logger.log(Y_hat, label)
                 loss = (
                     loss_fn(logits, label)
                     if loss_fn
                     else nn.CrossEntropyLoss()(logits, label)
                 )
 
-                probabilities[batch_idx] = Y_prob.cpu().numpy()
+                if task_type != TaskType.REGRESSION:
+                    probabilities[batch_idx] = Y_prob.detach().cpu().numpy()
+                else:
+                    probabilities[batch_idx] = (
+                        Y_hat.detach().cpu().numpy()
+                    )  # For regression, store predictions
+                    predictions[batch_idx] = Y_hat.detach().cpu().numpy()
+
                 labels[batch_idx] = label.item()
 
                 val_loss += loss.item()
@@ -655,16 +1093,35 @@ class StandardMILTrainingStrategy(TrainingStrategy):
         val_error /= len(loader)
         val_loss /= len(loader)
 
-        # Calculate AUC
-        auc = MetricsCalculator.calculate_auc(n_classes, labels, probabilities)
+        # Calculate AUC for classification tasks
+        auc = None
+        if task_type != TaskType.REGRESSION:
+            auc = MetricsCalculator.calculate_classification_metrics(
+                n_classes, labels, probabilities
+            )["auc"]
+        else:
+            # For regression, calculate regression metrics
+            regression_metrics = MetricsCalculator.calculate_regression_metrics(
+                labels, predictions
+            )
+            for metric_name, metric_value in regression_metrics.items():
+                mlflow.log_metric(f"val_{metric_name}", metric_value, step=epoch)
 
         # Log validation metrics
         MetricsCalculator.log_validation_metrics(
-            epoch, val_loss, val_error, auc, acc_logger, n_classes, writer
+            epoch,
+            val_loss,
+            val_error,
+            auc,
+            metrics_logger,
+            n_classes,
+            writer,
+            task_type,
         )
 
         print(
-            f"\nVal Set, val_loss: {val_loss:.4f}, val_error: {val_error:.4f}, auc: {auc:.4f}"
+            f"\nVal Set, val_loss: {val_loss:.4f}, val_error: {val_error:.4f}"
+            + (f", auc: {auc:.4f}" if auc is not None else "")
         )
 
         # Early stopping
@@ -682,11 +1139,14 @@ class StandardMILTrainingStrategy(TrainingStrategy):
         return False
 
 
+# training code
 class CLAMTrainingStrategy(TrainingStrategy):
     """Training strategy for CLAM models with instance-level clustering"""
 
-    def __init__(self, bag_weight: float = 0.7):
+    def __init__(self, bag_weight: float = 0.7, alpha: float = 0.7, beta: float = 0.1):
         self.bag_weight = bag_weight
+        self.alpha = alpha  # Weight for instance loss
+        self.beta = beta  # Weight for constraint loss
 
     def train_epoch(
         self,
@@ -694,99 +1154,118 @@ class CLAMTrainingStrategy(TrainingStrategy):
         model: nn.Module,
         loader: Any,
         optimizer: torch.optim.Optimizer,
+        task_type: TaskType,
         n_classes: int,
         writer: Optional[Any] = None,
         loss_fn: Optional[nn.Module] = None,
         **kwargs,
     ) -> None:
-        """Training loop for CLAM models with instance-level clustering"""
+        """Train one epoch for CLAM models"""
         model.train()
-        acc_logger = AccuracyLogger(n_classes=n_classes)
-        inst_logger = AccuracyLogger(n_classes=n_classes)
+        metrics_logger = MetricsLoggerFactory.create_logger(task_type, n_classes)
 
         train_loss = 0.0
         train_error = 0.0
         train_inst_loss = 0.0
+        train_constraint_loss = 0.0
         inst_count = 0
+        constraint_count = 0
 
-        print("\n")
+        print(f"\nTraining Epoch: {epoch}")
+
         for batch_idx, (data, label) in enumerate(loader):
             data, label = data.to(device), label.to(device)
+            optimizer.zero_grad()
 
             # Forward pass
-            logits, Y_prob, Y_hat, _, instance_dict = model(
+            logits, Y_prob, Y_hat, _, results_dict = model(
                 data, label=label, instance_eval=True
             )
 
-            # Calculate losses
-            acc_logger.log(Y_hat, label)
-            loss = (
-                loss_fn(logits, label)
-                if loss_fn
-                else nn.CrossEntropyLoss()(logits, label)
-            )
-            loss_value = loss.item()
+            # Calculate bag loss based on task type
+            if task_type == TaskType.REGRESSION:
+                # For regression, use the scaled values (Y_prob) for loss calculation
+                bag_loss = loss_fn(Y_prob, label)
+            else:
+                # For classification, use logits
+                bag_loss = loss_fn(logits, label)
 
-            instance_loss = instance_dict["instance_loss"]
-            inst_count += 1
-            instance_loss_value = instance_loss.item()
-            train_inst_loss += instance_loss_value
+            # Extract instance loss and constraint loss
+            instance_loss = results_dict.get("instance_loss", 0.0)
+            constraint_loss = results_dict.get("constraint_loss", 0.0)
 
-            total_loss = self.bag_weight * loss + (1 - self.bag_weight) * instance_loss
+            # Ensure Y_hat is available
+            if Y_hat is None:
+                Y_hat = Y_prob
 
-            # Log instance predictions
-            inst_preds = instance_dict["inst_preds"]
-            inst_labels = instance_dict["inst_labels"]
-            inst_logger.log_batch(inst_preds, inst_labels)
+            # Calculate total loss with appropriate weighting
+            total_loss = bag_loss
 
-            train_loss += loss_value
-            if (batch_idx + 1) % 20 == 0:
-                print(
-                    f"batch {batch_idx}, loss: {loss_value:.4f}, "
-                    f"instance_loss: {instance_loss_value:.4f}, "
-                    f"weighted_loss: {total_loss.item():.4f}, "
-                    f"label: {label.item()}, bag_size: {data.size(0)}"
-                )
+            # Add instance loss if present
+            if isinstance(instance_loss, torch.Tensor) and instance_loss.numel() > 0:
+                total_loss = total_loss + self.alpha * instance_loss
+                inst_count += 1
 
-            error = calculate_error(Y_hat, label)
-            train_error += error
+            # Add constraint loss if present (mainly for regression)
+            if (
+                isinstance(constraint_loss, torch.Tensor)
+                and constraint_loss.numel() > 0
+            ):
+                total_loss = total_loss + self.beta * constraint_loss
+                constraint_count += 1
 
             # Backward pass
             total_loss.backward()
             optimizer.step()
-            optimizer.zero_grad()
 
-        # Calculate epoch statistics
+            # Update metrics
+            train_loss += total_loss.item()
+
+            # Convert losses to scalars safely
+            if isinstance(instance_loss, torch.Tensor):
+                instance_loss_value = instance_loss.item()
+            else:
+                instance_loss_value = float(instance_loss)
+
+            if isinstance(constraint_loss, torch.Tensor):
+                constraint_loss_value = constraint_loss.item()
+            else:
+                constraint_loss_value = float(constraint_loss)
+
+            train_inst_loss += instance_loss_value
+            train_constraint_loss += constraint_loss_value
+
+            error = calculate_error(Y_hat, label, task_type)
+            train_error += error
+
+            # Log batch metrics
+            metrics_logger.log_batch(Y_hat, label)
+
+        # Calculate epoch averages
         train_loss /= len(loader)
         train_error /= len(loader)
-
-        # Log instance metrics
-        if inst_count > 0:
-            train_inst_loss /= inst_count
-            print("\n")
-            for i in range(2):
-                acc, correct, count = inst_logger.get_summary(i)
-                print(f"class {i} clustering acc {acc}: correct {correct}/{count}")
-                if acc is not None:
-                    mlflow.log_metric(
-                        f"train_inst_cluster_class_{i}_acc", acc, step=epoch
-                    )
-
-        print(
-            f"Epoch: {epoch}, train_loss: {train_loss:.4f}, "
-            f"train_clustering_loss: {train_inst_loss:.4f}, train_error: {train_error:.4f}"
+        train_inst_loss = train_inst_loss / inst_count if inst_count > 0 else 0.0
+        train_constraint_loss = (
+            train_constraint_loss / constraint_count if constraint_count > 0 else 0.0
         )
 
-        # Log training metrics
+        # Log using MetricsCalculator
         MetricsCalculator.log_training_metrics(
-            epoch,
-            train_loss,
-            train_error,
-            train_inst_loss,
-            acc_logger,
-            n_classes,
-            writer,
+            epoch=epoch,
+            train_loss=train_loss,
+            train_error=train_error,
+            train_inst_loss=train_inst_loss,
+            train_constraint_loss=train_constraint_loss,
+            metrics_logger=metrics_logger,
+            n_classes=n_classes,
+            writer=writer,
         )
+
+        # Log constraint loss for regression if present
+        if task_type == TaskType.REGRESSION and constraint_count > 0:
+            print(f"Train Constraint Loss: {train_constraint_loss:.4f}")
+            if writer:
+                writer.add_scalar("train/constraint_loss", train_constraint_loss, epoch)
 
     def validate(
         self,
@@ -794,94 +1273,176 @@ class CLAMTrainingStrategy(TrainingStrategy):
         epoch: int,
         model: nn.Module,
         loader: Any,
+        task_type: TaskType,
         n_classes: int,
         early_stopping: Optional[EarlyStopping] = None,
         writer: Optional[Any] = None,
         loss_fn: Optional[nn.Module] = None,
         results_dir: Optional[str] = None,
+        **kwargs,
     ) -> bool:
-        """Validation loop for CLAM models with instance-level clustering"""
+        """Validate CLAM model"""
         model.eval()
-        acc_logger = AccuracyLogger(n_classes=n_classes)
-        inst_logger = AccuracyLogger(n_classes=n_classes)
+        metrics_logger = MetricsLoggerFactory.create_logger(task_type, n_classes)
+
         val_loss = 0.0
         val_error = 0.0
         val_inst_loss = 0.0
+        val_constraint_loss = 0.0
         inst_count = 0
+        constraint_count = 0
 
-        probabilities = np.zeros((len(loader), n_classes))
-        labels = np.zeros(len(loader))
+        # For metrics calculation
+        all_probs = []
+        all_labels = []
+        all_predictions = []
 
-        with torch.inference_mode():
+        with torch.no_grad():
             for batch_idx, (data, label) in enumerate(loader):
                 data, label = data.to(device), label.to(device)
 
-                logits, Y_prob, Y_hat, _, instance_dict = model(
+                # Forward pass
+                logits, Y_prob, Y_hat, _, results_dict = model(
                     data, label=label, instance_eval=True
                 )
 
-                acc_logger.log(Y_hat, label)
-                loss = (
-                    loss_fn(logits, label)
-                    if loss_fn
-                    else nn.CrossEntropyLoss()(logits, label)
-                )
-                val_loss += loss.item()
+                # Calculate bag loss based on task type
+                if task_type == TaskType.REGRESSION:
+                    bag_loss = loss_fn(Y_prob, label)
+                else:
+                    bag_loss = loss_fn(logits, label)
 
-                instance_loss = instance_dict["instance_loss"]
-                inst_count += 1
-                instance_loss_value = instance_loss.item()
+                # Extract instance loss and constraint loss (constrain loss is always zero for validation, which is enforced)
+                instance_loss = results_dict.get("instance_loss", 0.0)
+                constraint_loss = results_dict.get("constraint_loss", 0.0)
+
+                # Ensure Y_hat is available
+                if Y_hat is None:
+                    Y_hat = Y_prob
+
+                # Calculate total loss with appropriate weighting
+                total_loss = bag_loss
+
+                # Add instance loss if present
+                if (
+                    isinstance(instance_loss, torch.Tensor)
+                    and instance_loss.numel() > 0
+                ):
+                    total_loss = total_loss + self.alpha * instance_loss
+                    inst_count += 1
+
+                # Add constraint loss if present (mainly for regression)
+                if (
+                    isinstance(constraint_loss, torch.Tensor)
+                    and constraint_loss.numel() > 0
+                ):
+                    total_loss = total_loss + self.beta * constraint_loss
+                    constraint_count += 1
+
+                # Convert losses to scalars safely
+                if isinstance(instance_loss, torch.Tensor):
+                    instance_loss_value = instance_loss.item()
+                else:
+                    instance_loss_value = float(instance_loss)
+
+                if isinstance(constraint_loss, torch.Tensor):
+                    constraint_loss_value = constraint_loss.item()
+                else:
+                    constraint_loss_value = float(constraint_loss)
+
+                val_loss += total_loss.item()
                 val_inst_loss += instance_loss_value
+                val_constraint_loss += constraint_loss_value
 
-                inst_preds = instance_dict["inst_preds"]
-                inst_labels = instance_dict["inst_labels"]
-                inst_logger.log_batch(inst_preds, inst_labels)
-
-                probabilities[batch_idx] = Y_prob.cpu().numpy()
-                labels[batch_idx] = label.item()
-
-                error = calculate_error(Y_hat, label)
+                error = calculate_error(Y_hat, label, task_type)
                 val_error += error
 
-        val_error /= len(loader)
+                # Store probabilities and labels for metrics calculation
+                if task_type != TaskType.REGRESSION:
+                    all_probs.append(Y_prob.detach().cpu().numpy())
+                else:
+                    all_predictions.append(Y_hat.detach().cpu().numpy())
+
+                all_labels.append(label.detach().cpu().numpy())
+
+                # Log batch metrics
+                metrics_logger.log_batch(Y_hat, label)
+
+        # Calculate metrics
         val_loss /= len(loader)
+        val_error /= len(loader)
+        val_inst_loss = val_inst_loss / inst_count if inst_count > 0 else 0.0
+        val_constraint_loss = (
+            val_constraint_loss / constraint_count if constraint_count > 0 else 0.0
+        )
 
-        # Calculate AUC
-        auc = MetricsCalculator.calculate_auc(n_classes, labels, probabilities)
+        # Prepare data for metrics calculation
+        all_labels_np = np.concatenate(all_labels)
 
-        # Log validation metrics
+        # Calculate task-specific metrics
+        auc = None
+        regression_metrics = None
+
+        if task_type != TaskType.REGRESSION:
+            # Classification metrics
+            all_probs_np = np.concatenate(all_probs)
+            if n_classes == 2:
+                auc = roc_auc_score(all_labels_np, all_probs_np[:, 1])
+            else:
+                auc = roc_auc_score(
+                    all_labels_np, all_probs_np, multi_class="ovr", average="macro"
+                )
+        else:
+            # Regression metrics
+            all_predictions_np = np.concatenate(all_predictions)
+            regression_metrics = MetricsCalculator.calculate_regression_metrics(
+                all_labels_np, all_predictions_np
+            )
+
+            # Log regression metrics
+            for metric_name, metric_value in regression_metrics.items():
+                mlflow.log_metric(f"val_{metric_name}", metric_value, step=epoch)
+                if writer:
+                    writer.add_scalar(f"val/{metric_name}", metric_value, epoch)
+
+        # Print validation results
+        print_str = (
+            f"Val Loss: {val_loss:.4f}, Val Instance Loss: {val_inst_loss:.4f}, "
+            f"Val Error: {val_error:.4f}"
+        )
+        if auc is not None:
+            print_str += f", Val AUC: {auc:.4f}"
+        if task_type == TaskType.REGRESSION and constraint_count > 0:
+            print_str += f", Val Constraint Loss: {val_constraint_loss:.4f}"
+        print(print_str)
+
+        # Log validation metrics using MetricsCalculator
         MetricsCalculator.log_validation_metrics(
-            epoch, val_loss, val_error, auc, acc_logger, n_classes, writer
+            epoch=epoch,
+            val_loss=val_loss,
+            val_error=val_error,
+            auc=auc,
+            metrics_logger=metrics_logger,
+            n_classes=n_classes,
+            writer=writer,
+            task_type=task_type,
         )
 
-        # Log instance metrics
-        if inst_count > 0:
-            val_inst_loss /= inst_count
-            mlflow.log_metric("val_inst_loss", val_inst_loss, step=epoch)
-
-            for i in range(2):
-                acc, correct, count = inst_logger.get_summary(i)
-                print(f"class {i} clustering acc {acc}: correct {correct}/{count}")
-                if acc is not None:
-                    mlflow.log_metric(
-                        f"val_inst_cluster_class_{i}_acc", acc, step=epoch
-                    )
-
-        print(
-            f"\nVal Set, val_loss: {val_loss:.4f}, val_error: {val_error:.4f}, auc: {auc:.4f}"
-        )
-
-        if writer:
-            writer.add_scalar("val/inst_loss", val_inst_loss, epoch)
+        # Log constraint loss for regression if present
+        if task_type == TaskType.REGRESSION and constraint_count > 0 and writer:
+            writer.add_scalar("val/constraint_loss", val_constraint_loss, epoch)
 
         # Early stopping
         if early_stopping and results_dir:
+            # For regression, use val_loss for early stopping
+            # Alternatively, you could use a specific regression metric
             early_stopping(
                 epoch,
                 val_loss,
                 model,
                 ckpt_name=os.path.join(results_dir, f"s_{cur}_checkpoint.pt"),
             )
+
             if early_stopping.early_stop:
                 print("Early stopping")
                 return True
@@ -901,21 +1462,32 @@ class TrainingStrategyFactory:
             return StandardMILTrainingStrategy()
 
 
-# ==================== MODEL EVALUATOR ====================
+# ==================== UPDATED MODEL EVALUATOR ====================
 class ModelEvaluator:
     """Handles model evaluation and summary statistics"""
 
     @staticmethod
     def summary(
-        model: nn.Module, loader: Any, n_classes: int
-    ) -> Tuple[Dict[str, Any], float, float, AccuracyLogger]:
+        model: nn.Module,
+        loader: Any,
+        n_classes: int,
+        task_type: TaskType = TaskType.BINARY,
+    ) -> Tuple[Dict[str, Any], float, float, BaseMetricsLogger]:
         """Generate summary statistics for model performance"""
-        acc_logger = AccuracyLogger(n_classes=n_classes)
+        metrics_logger = MetricsLoggerFactory.create_logger(task_type, n_classes)
         model.eval()
         test_error = 0.0
 
-        all_probs = np.zeros((len(loader), n_classes))
-        all_labels = np.zeros(len(loader))
+        # Initialize arrays based on task type
+        if task_type != TaskType.REGRESSION:
+            all_probs = np.zeros((len(loader), n_classes))
+            all_labels = np.zeros(len(loader))
+            all_predictions = np.zeros(len(loader))
+        else:
+            # For regression with 2D output [primary, secondary]
+            all_probs = np.zeros((len(loader), 2))  # Store both primary and secondary
+            all_labels = np.zeros((len(loader), 2))  # Store both labels if available
+            all_predictions = np.zeros((len(loader), 2))
 
         slide_ids = loader.dataset.slide_data["slide_id"]
         patient_results = {}
@@ -927,219 +1499,85 @@ class ModelEvaluator:
             with torch.inference_mode():
                 logits, Y_prob, Y_hat, _, _ = model(data)
 
-            acc_logger.log(Y_hat, label)
-            probs = Y_prob.cpu().numpy()
-            all_probs[batch_idx] = probs
-            all_labels[batch_idx] = label.item()
+            metrics_logger.log(Y_hat, label)
 
-            patient_results.update(
-                {
-                    slide_id: {
-                        "slide_id": np.array(slide_id),
-                        "prob": probs,
-                        "label": label.item(),
-                    }
+            if task_type != TaskType.REGRESSION:
+                probs = Y_prob.cpu().numpy()
+                all_probs[batch_idx] = probs
+                all_predictions[batch_idx] = Y_hat.cpu().numpy()
+
+                # Handle label conversion safely for classification
+                label_np = label.cpu().numpy()
+                if label_np.size == 1:
+                    all_labels[batch_idx] = label_np.item()
+                else:
+                    # For multi-element labels, take the first one or use appropriate indexing
+                    all_labels[batch_idx] = label_np.flatten()[0]
+
+                patient_results[slide_id] = {
+                    "slide_id": np.array(slide_id),
+                    "prob": probs,
+                    "label": all_labels[batch_idx],
                 }
-            )
+            else:
+                # Handle regression with 2D output
+                preds = Y_hat.cpu().numpy()
 
-            error = calculate_error(Y_hat, label)
+                # Ensure preds is 2D [primary, secondary]
+                if preds.ndim == 1:
+                    preds = preds.reshape(1, -1)
+
+                # Store predictions
+                all_probs[batch_idx] = preds[0]  # Store as 1D array of length 2
+                all_predictions[batch_idx] = preds[0]
+
+                # Handle label formatting for regression - FIXED for 2D arrays
+                label_np = label.cpu().numpy()
+
+                # Handle different label formats for regression
+                if label_np.ndim == 0:
+                    # Scalar label
+                    all_labels[batch_idx] = [label_np.item(), label_np.item()]
+                elif label_np.size == 1:
+                    # 1D array with single element
+                    all_labels[batch_idx] = [label_np.item(), label_np.item()]
+                else:
+                    # Multi-element array - extract first two elements safely
+                    label_flat = label_np.flatten()
+                    if len(label_flat) >= 2:
+                        all_labels[batch_idx] = [label_flat[0], label_flat[1]]
+                    else:
+                        # Fallback: duplicate the first element
+                        all_labels[batch_idx] = [label_flat[0], label_flat[0]]
+
+                patient_results[slide_id] = {
+                    "slide_id": np.array(slide_id),
+                    "prob": preds[0],  # Store as 1D array [primary, secondary]
+                    "label": all_labels[batch_idx],
+                }
+
+            error = calculate_error(Y_hat, label, task_type)
             test_error += error
 
         test_error /= len(loader)
 
-        # Calculate AUC
-        auc = MetricsCalculator.calculate_auc(n_classes, all_labels, all_probs)
-
-        return patient_results, test_error, auc, acc_logger
-
-
-# ==================== SINGLE FOLD TRAINER ====================
-class FoldTrainer:
-    """Handles training for a single fold"""
-
-    def __init__(self, config: MILTrainingConfig, fold_id: int, folds: int):
-        self.config = config
-        self.fold_id = fold_id
-        self.folds = folds
-        self.writer = None
-        self._setup_writer()
-
-    def _setup_writer(self) -> None:
-        """Setup TensorBoard writer if logging is enabled"""
-        if self.config.log_data:
-            from tensorboardX import SummaryWriter
-
-            writer_dir = os.path.join(self.config.results_dir, str(self.fold_id))
-            os.makedirs(writer_dir, exist_ok=True)
-            self.writer = SummaryWriter(writer_dir, flush_secs=15)
-
-    def setup_data_splits(self, datasets: Tuple[Any, Any, Any]) -> Tuple[Any, Any, Any]:
-        """Setup and log data splits"""
-        print("\nInit train/val/test splits...", end=" ")
-        train_split, val_split, test_split = datasets
-
-        # Save splits
-        split_csv_path = os.path.join(
-            self.config.results_dir, f"splits_{self.fold_id}.csv"
-        )
-        save_splits(datasets, ["train", "val", "test"], split_csv_path)
-        mlflow.log_artifact(split_csv_path)
-        print("Done!")
-
-        print(f"Training on {len(train_split)} samples")
-        print(f"Validating on {len(val_split)} samples")
-        print(f"Testing on {len(test_split)} samples")
-
-        return train_split, val_split, test_split
-
-    def train(self, datasets: Tuple[Any, Any, Any]) -> FoldResults:
-        """Train for a single fold with MLflow tracking"""
-        with mlflow.start_run(run_name=f"Fold {self.fold_id}", nested=True):
-            # Log hyperparameters
-            mlflow.log_params(
-                {
-                    "fold": self.fold_id,
-                    "max_epochs": self.config.max_epochs,
-                    "lr": self.config.lr,
-                    "model_type": self.config.model_type,
-                    "bag_loss": self.config.bag_loss,
-                    "drop_out": self.config.drop_out,
-                    "n_classes": self.config.n_classes,
-                }
+        # Calculate metrics based on task type
+        auc = None
+        if task_type != TaskType.REGRESSION:
+            auc = MetricsCalculator.calculate_classification_metrics(
+                n_classes, all_labels, all_probs
+            )["auc"]
+        else:
+            # For regression, calculate metrics for primary and secondary separately
+            regression_metrics = MetricsCalculator.calculate_regression_metrics(
+                all_labels, all_predictions
             )
+            # Log regression metrics
+            for metric_name, metric_value in regression_metrics.items():
+                mlflow.log_metric(f"test_{metric_name}", metric_value)
 
-            print(f"\nTraining Fold {self.fold_id}/{self.folds}!")
+        return patient_results, test_error, auc, metrics_logger
 
-            # Setup data
-            train_split, val_split, test_split = self.setup_data_splits(datasets)
-
-            # Setup components
-            loss_fn = ModelFactory.create_loss_function(
-                self.config.bag_loss, self.config.n_classes
-            )
-            model = ModelFactory.create_model(self.config)
-            optimizer = get_optim(model, self.config)
-            train_loader, val_loader, test_loader = (
-                DataLoaderFactory.create_data_loaders(
-                    self.config, train_split, val_split, test_split
-                )
-            )
-
-            early_stopping = (
-                EarlyStopping(patience=20, stop_epoch=50, verbose=True)
-                if self.config.early_stopping
-                else None
-            )
-
-            # Get training strategy
-            strategy = TrainingStrategyFactory.create_strategy(self.config)
-
-            # Training loop
-            stop_training = self._run_training_loop(
-                model,
-                train_loader,
-                val_loader,
-                strategy,
-                loss_fn,
-                optimizer,
-                early_stopping,
-            )
-
-            # Load best/final model
-            ckpt_path = os.path.join(
-                self.config.results_dir, f"s_{self.fold_id}_checkpoint.pt"
-            )
-            if self.config.early_stopping and early_stopping and stop_training:
-                model.load_state_dict(torch.load(ckpt_path))
-            else:
-                torch.save(model.state_dict(), ckpt_path)
-
-            mlflow.log_artifact(ckpt_path)
-
-            # Final evaluation
-            return self._final_evaluation(model, val_loader, test_loader)
-
-    def _run_training_loop(
-        self,
-        model: nn.Module,
-        train_loader: Any,
-        val_loader: Any,
-        strategy: TrainingStrategy,
-        loss_fn: nn.Module,
-        optimizer: torch.optim.Optimizer,
-        early_stopping: Optional[EarlyStopping],
-    ) -> bool:
-        """Run the main training loop"""
-        stop_training = False
-
-        for epoch in range(self.config.max_epochs):
-            print("#" * 128)
-            print(
-                f"Running training for fold:{self.fold_id}/{self.folds}, on epoch: {epoch}/{self.config.max_epochs} ..."
-            )
-            print("#" * 128)
-
-            # Train epoch
-            strategy.train_epoch(
-                epoch,
-                model,
-                train_loader,
-                optimizer,
-                self.config.n_classes,
-                self.writer,
-                loss_fn,
-            )
-
-            # Validate
-            stop_training = strategy.validate(
-                self.fold_id,
-                epoch,
-                model,
-                val_loader,
-                self.config.n_classes,
-                early_stopping,
-                self.writer,
-                loss_fn,
-                self.config.results_dir,
-            )
-
-            if stop_training:
-                break
-
-        return stop_training
-
-    def _final_evaluation(
-        self, model: nn.Module, val_loader: Any, test_loader: Any
-    ) -> FoldResults:
-        """Perform final evaluation and return results"""
-        # Validation evaluation
-        _, val_error, val_auc, _ = ModelEvaluator.summary(
-            model, val_loader, self.config.n_classes
-        )
-        print(f"Val error: {val_error:.4f}, ROC AUC: {val_auc:.4f}")
-
-        # Test evaluation
-        results_dict, test_error, test_auc, acc_logger = ModelEvaluator.summary(
-            model, test_loader, self.config.n_classes
-        )
-        print(f"Test error: {test_error:.4f}, ROC AUC: {test_auc:.4f}")
-
-        # Log final metrics
-        MetricsCalculator.log_final_metrics(
-            val_error, val_auc, test_error, test_auc, acc_logger, self.config.n_classes
-        )
-
-        # Cleanup
-        if self.writer:
-            self.writer.close()
-
-        return {
-            "results_dict": results_dict,
-            "test_auc": test_auc,
-            "val_auc": val_auc,
-            "test_acc": 1 - test_error,
-            "val_acc": 1 - val_error,
-        }
 
 
 # ==================== MODEL MANAGER ====================
@@ -1155,7 +1593,7 @@ class ModelManager:
             raise ValueError("n_classes must be set before reconstructing model")
 
         # Create model architecture
-        if config.model_type == "clam_sb":
+        if config.task == TaskType.BINARY and config.model_type == "clam_sb":
             model = CLAM_SB(
                 size_arg=config.model_size,
                 dropout=config.drop_out,
@@ -1163,8 +1601,28 @@ class ModelManager:
                 subtyping=config.subtyping,
                 embed_dim=config.embed_dim,
             )
-        elif config.model_type == "clam_mb":
+        elif config.task == TaskType.MULTICLASS and config.model_type == "clam_mb":
             model = CLAM_MB(
+                size_arg=config.model_size,
+                dropout=config.drop_out,
+                n_classes=config.n_classes,
+                subtyping=config.subtyping,
+                embed_dim=config.embed_dim,
+            )
+        elif config.task == TaskType.REGRESSION and (
+            config.model_type == "clam_sb" or config.model_type == "clam_sbr"
+        ):
+            model = CLAM_SB_Regression(
+                size_arg=config.model_size,
+                dropout=config.drop_out,
+                n_classes=config.n_classes,
+                subtyping=config.subtyping,
+                embed_dim=config.embed_dim,
+            )
+        elif config.task == TaskType.REGRESSION and (
+            config.model_type == "clam_mb" or config.model_type == "clam_mbr"
+        ):
+            model = CLAM_MB_Regression(
                 size_arg=config.model_size,
                 dropout=config.drop_out,
                 n_classes=config.n_classes,
@@ -1267,6 +1725,258 @@ class ModelManager:
         except Exception as e:
             print(f"Error logging model to MLflow: {e}")
             return None
+
+
+# ==================== SINGLE FOLD TRAINER ====================
+class FoldTrainer:
+    """Handles training for a single fold"""
+
+    def __init__(self, config: MILTrainingConfig, fold_id: int, folds: int):
+        self.config = config
+        self.fold_id = fold_id
+        self.folds = folds
+        self.writer = None
+        self._setup_writer()
+
+    def _setup_writer(self) -> None:
+        """Setup TensorBoard writer if logging is enabled"""
+        if self.config.log_data:
+            from tensorboardX import SummaryWriter
+
+            writer_dir = os.path.join(self.config.results_dir, str(self.fold_id))
+            os.makedirs(writer_dir, exist_ok=True)
+            self.writer = SummaryWriter(writer_dir, flush_secs=15)
+
+    def setup_data_splits(self, datasets: Tuple[Any, Any, Any]) -> Tuple[Any, Any, Any]:
+        """Setup and log data splits"""
+        print("\nInit train/val/test splits...", end=" ")
+        train_split, val_split, test_split = datasets
+
+        # Save splits
+        split_csv_path = os.path.join(
+            self.config.results_dir, f"splits_{self.fold_id}.csv"
+        )
+        save_splits(datasets, ["train", "val", "test"], split_csv_path)
+        mlflow.log_artifact(split_csv_path)
+        print("Done!")
+
+        print(f"Training on {len(train_split)} samples")
+        print(f"Validating on {len(val_split)} samples")
+        print(f"Testing on {len(test_split)} samples")
+
+        return train_split, val_split, test_split
+
+    def train(self, datasets: Tuple[Any, Any, Any]) -> FoldResults:
+        """Train for a single fold with MLflow tracking"""
+        with mlflow.start_run(run_name=f"Fold {self.fold_id}", nested=True):
+            # Log hyperparameters
+            mlflow.log_params(
+                {
+                    "fold": self.fold_id,
+                    "max_epochs": self.config.max_epochs,
+                    "lr": self.config.lr,
+                    "model_type": self.config.model_type,
+                    "bag_loss": self.config.bag_loss,
+                    "drop_out": self.config.drop_out,
+                    "n_classes": self.config.n_classes,
+                    "task_type": (
+                        self.config.task.value
+                        if hasattr(self.config.task, "value")
+                        else str(self.config.task)
+                    ),
+                }
+            )
+
+            print(f"\nTraining Fold {self.fold_id}/{self.folds}!")
+
+            # Setup data
+            train_split, val_split, test_split = self.setup_data_splits(datasets)
+
+            # Setup components
+            loss_fn = ModelFactory.create_loss_function(
+                self.config.bag_loss, self.config.n_classes, self.config.task
+            )
+            model = ModelFactory.create_model(self.config)
+            optimizer = get_optim(model, self.config)
+            train_loader, val_loader, test_loader = (
+                DataLoaderFactory.create_data_loaders(
+                    self.config, train_split, val_split, test_split
+                )
+            )
+
+            early_stopping = (
+                EarlyStopping(patience=20, stop_epoch=50, verbose=True)
+                if self.config.early_stopping
+                else None
+            )
+
+            # Get training strategy
+            strategy = TrainingStrategyFactory.create_strategy(self.config)
+
+            # Training loop
+            stop_training = self._run_training_loop(
+                model,
+                train_loader,
+                val_loader,
+                strategy,
+                loss_fn,
+                optimizer,
+                early_stopping,
+            )
+
+            # Load best/final model
+            ckpt_path = os.path.join(
+                self.config.results_dir, f"s_{self.fold_id}_checkpoint.pt"
+            )
+            if self.config.early_stopping and early_stopping and stop_training:
+                model.load_state_dict(torch.load(ckpt_path))
+            else:
+                torch.save(model.state_dict(), ckpt_path)
+
+            mlflow.log_artifact(ckpt_path)
+
+            # Final evaluation
+            return self._final_evaluation(model, val_loader, test_loader)
+
+    def _run_training_loop(
+        self,
+        model: nn.Module,
+        train_loader: Any,
+        val_loader: Any,
+        strategy: TrainingStrategy,
+        loss_fn: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        early_stopping: Optional[EarlyStopping],
+    ) -> bool:
+        """Run the main training loop"""
+        stop_training = False
+
+        for epoch in range(self.config.max_epochs):
+            print("#" * 128)
+            print(
+                f"Running training for fold:{self.fold_id}/{self.folds}, on epoch: {epoch}/{self.config.max_epochs} ..."
+            )
+            print("#" * 128)
+
+            # Train epoch
+            strategy.train_epoch(
+                epoch,
+                model,
+                train_loader,
+                optimizer,
+                self.config.task,
+                self.config.n_classes,
+                self.writer,
+                loss_fn,
+            )
+
+            # Validate
+            stop_training = strategy.validate(
+                self.fold_id,
+                epoch,
+                model,
+                val_loader,
+                self.config.task,
+                self.config.n_classes,
+                early_stopping,
+                self.writer,
+                loss_fn,
+                self.config.results_dir,
+            )
+
+            if stop_training:
+                break
+
+        return stop_training
+
+    # _final_evaluation code
+    def _final_evaluation(
+        self, model: nn.Module, val_loader: Any, test_loader: Any
+    ) -> FoldResults:
+        """Perform final evaluation and return results"""
+
+        # Check task type
+        is_regression = self.config.task == TaskType.REGRESSION
+
+        # --- Validation evaluation ---
+        # ModelEvaluator.summary is assumed to return:
+        # (results_dict, primary_metric_value, secondary_metric_value, metrics_logger)
+        # For classification: (..., error, auc, ...)
+        # For regression: (..., primary_metric, None, ...) -> We will use MAE as primary metric
+        _, val_error, val_auc, val_metrics_logger = ModelEvaluator.summary(
+            model, val_loader, self.config.n_classes, self.config.task
+        )
+
+        # Select the primary metric to print based on task
+        if is_regression:
+            val_mae = val_metrics_logger.get_all_metrics().get("mae", val_error)
+            val_metric_str = f"MAE: {val_mae:.4f}, Error (Loss): {val_error:.4f}"
+            val_auc = None  # Explicitly clear AUC for printing/logging
+        else:
+            val_metric_str = f"Error: {val_error:.4f}" + (
+                f", ROC AUC: {val_auc:.4f}" if val_auc is not None else ""
+            )
+
+        print(f"Val {val_metric_str}")
+
+        # --- Test evaluation ---
+        results_dict, test_error, test_auc, test_metrics_logger = (
+            ModelEvaluator.summary(
+                model, test_loader, self.config.n_classes, self.config.task
+            )
+        )
+
+        # Select the primary metric to print based on task
+        if is_regression:
+            test_mae = test_metrics_logger.get_all_metrics().get("mae", test_error)
+            test_metric_str = f"MAE: {test_mae:.4f}, Error (Loss): {test_error:.4f}"
+            test_auc = None  # Explicitly clear AUC for printing/logging
+        else:
+            test_metric_str = f"Error: {test_error:.4f}" + (
+                f", ROC AUC: {test_auc:.4f}" if test_auc is not None else ""
+            )
+
+        print(f"Test {test_metric_str}")
+
+        # --- Log final metrics ---
+        # Note: Log final metrics should handle the task type internally.
+        MetricsCalculator.log_final_metrics(
+            val_error,
+            val_auc,  # Pass None if regression
+            test_error,
+            test_auc,  # Pass None if regression
+            test_metrics_logger,
+            self.config.n_classes,
+            self.config.task,
+        )
+
+        # --- Cleanup ---
+        if self.writer:
+            self.writer.close()
+
+        # --- Return Results ---
+        # The 'acc' key is repurposed to store MAE for regression
+        val_primary_result = (
+            val_metrics_logger.get_all_metrics().get("mae", 0.0)
+            if is_regression
+            else (1.0 - val_error)
+        )
+        test_primary_result = (
+            test_metrics_logger.get_all_metrics().get("mae", 0.0)
+            if is_regression
+            else (1.0 - test_error)
+        )
+
+        return {
+            "results_dict": results_dict,
+            "test_auc": test_auc if test_auc is not None else 0.0,
+            "val_auc": val_auc if val_auc is not None else 0.0,
+            # For classification, return 1 - Error (Accuracy).
+            # For regression, return MAE.
+            "test_acc": test_primary_result,
+            "val_acc": val_primary_result,
+        }
+
 
 
 # ==================== MAIN TRAINING ORCHESTRATOR ====================

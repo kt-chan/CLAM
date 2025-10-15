@@ -6,6 +6,7 @@ from dataset_modules.dataset_generic import (
     Generic_MIL_Dataset,
 )
 from utils.train_utils import MILTrainingConfig, TrainingResults, run_training
+from utils.utils import TaskType
 
 
 def setup_dataset(config: MILTrainingConfig) -> Generic_MIL_Dataset:
@@ -19,9 +20,9 @@ def setup_dataset(config: MILTrainingConfig) -> Generic_MIL_Dataset:
     if not os.path.isdir(data_dir):
         raise FileNotFoundError(f"Data directory {data_dir} does not exist")
 
-    if config.task == "task_1_tumor_vs_normal":
+    if config.task == TaskType.BINARY:
         create_splits(
-            task="task_1_tumor_vs_normal",
+            task=config.task,
             label_frac=config.label_frac,
             seed=config.seed,
             k=config.k,
@@ -39,9 +40,9 @@ def setup_dataset(config: MILTrainingConfig) -> Generic_MIL_Dataset:
             ignore=[],
         )
 
-    elif config.task == "task_2_tumor_subtyping":
+    elif config.task == TaskType.MULTICLASS:
         create_splits(
-            task="task_2_tumor_subtyping",
+            task=config.task,
             label_frac=config.label_frac,
             seed=config.seed,
             k=config.k,
@@ -63,6 +64,25 @@ def setup_dataset(config: MILTrainingConfig) -> Generic_MIL_Dataset:
             assert (
                 config.subtyping
             ), "Subtyping must be enabled for CLAM models with tumor subtyping task"
+    elif config.task == TaskType.REGRESSION:
+        create_splits(
+            task=config.task,
+            label_frac=config.label_frac,
+            seed=config.seed,
+            k=config.k,
+            val_frac=0.15,
+            test_frac=0.15,
+        )
+        dataset = Generic_MIL_Dataset(
+            csv_path="dataset_csv/tumor_regression_dummy_clean.csv",
+            data_dir=data_dir,
+            shuffle=False,
+            seed=config.seed,
+            print_info=True,
+            label_dict={},
+            patient_strat=False,
+            ignore=[],
+        )
     else:
         raise NotImplementedError(f"Task {config.task} not implemented")
 
@@ -157,9 +177,9 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model_type",
         type=str,
-        choices=["clam_sb", "clam_mb", "mil"],
+        choices=["clam_sb", "clam_mb", "clam_sbr", "clam_mbr", "mil"],
         default="clam_sb",
-        help="type of model (default: clam_sb, clam w/ single attention branch)",
+        help="type of model (default: clam_sb and clam_mb for single head/multihead attention for classification, with clam_sbr and clam_mbr for regression)",
     )
     parser.add_argument(
         "--exp_code", type=str, help="experiment code for saving results"
@@ -180,7 +200,11 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--task",
         type=str,
-        choices=["task_1_tumor_vs_normal", "task_2_tumor_subtyping"],
+        choices=[
+            "task_1_tumor_vs_normal",
+            "task_2_tumor_subtyping",
+            "task_3_tumor_count",
+        ],
         help="task to perform",
     )
 
