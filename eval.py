@@ -20,146 +20,11 @@ from sklearn.metrics import classification_report, confusion_matrix
 import seaborn as sns
 
 
-class EvalConfig:
-    """Configuration class for evaluation with strong type hints."""
-
-    # Data parameters
-    data_root_dir: Optional[str]
-    data_set_name: Optional[str]
-
-    # Results and paths
-    results_dir: str
-    save_exp_code: Optional[str]
-    models_exp_code: Optional[str]
-    splits_dir: Optional[str]
-
-    # Model parameters
-    model_size: str
-    model_type: str
-    drop_out: float
-    embed_dim: int
-
-    # Evaluation parameters
-    k: int
-    k_start: int
-    k_end: int
-    fold: int
-    micro_average: bool
-    split: str
-    task: Optional[str]
-    subtyping: bool
-
-    # MLflow model registration parameters
-    registered_model_name: Optional[str]
-    register_best_model: bool
-    detailed_metrics: bool
-
-    # Derived attributes
-    n_classes: Optional[int]
-    save_dir: str
-    models_dir: str
-    start_fold: int
-    end_fold: int
-    folds: range
-
-    def __init__(self, **kwargs) -> None:
-        # Data parameters
-        self.data_root_dir = kwargs.get("data_root_dir")
-        self.data_set_name = kwargs.get("data_set_name")
-
-        # Results and paths
-        self.results_dir = kwargs.get("results_dir", "./results")
-        self.save_exp_code = kwargs.get("save_exp_code")
-        self.models_exp_code = kwargs.get("models_exp_code")
-        self.splits_dir = kwargs.get("splits_dir")
-
-        # Model parameters
-        self.model_size = kwargs.get("model_size", "small")
-        self.model_type = kwargs.get("model_type", "clam_sb")
-        self.drop_out = kwargs.get("drop_out", 0.25)
-        self.embed_dim = kwargs.get("embed_dim", 1024)
-
-        # Evaluation parameters
-        self.k = kwargs.get("k", 10)
-        self.k_start = kwargs.get("k_start", -1)
-        self.k_end = kwargs.get("k_end", -1)
-        self.fold = kwargs.get("fold", -1)
-        self.micro_average = kwargs.get("micro_average", False)
-        self.split = kwargs.get("split", "test")
-        self.task = kwargs.get("task")
-        self.subtyping = kwargs.get("subtyping", False)
-
-        # MLflow model registration parameters
-        self.registered_model_name = kwargs.get("registered_model_name")
-        self.register_best_model = kwargs.get("register_best_model", True)
-        self.detailed_metrics = kwargs.get("detailed_metrics", True)
-
-        # Setup derived attributes
-        self._setup_derived_attributes()
-
-    def _setup_derived_attributes(self) -> None:
-        """Setup derived attributes and paths."""
-        # Set number of classes based on task
-        if self.task == "task_1_tumor_vs_normal":
-            self.n_classes = 2
-        elif self.task == "task_2_tumor_subtyping":
-            self.n_classes = 3
-        else:
-            self.n_classes = None
-
-        # Setup directories
-        self.save_dir = os.path.join("./eval_results", f"EVAL_{self.save_exp_code}")
-        self.models_dir = os.path.join(self.results_dir, str(self.models_exp_code))
-
-        # Setup default registered model name
-        if self.registered_model_name is None and self.models_exp_code:
-            self.registered_model_name = f"{self.model_type}_{self.models_exp_code}"
-
-        os.makedirs(self.save_dir, exist_ok=True)
-
-        # Setup splits directory
-        if self.splits_dir is None:
-            self.splits_dir = self.models_dir
-
-        # Validate directories
-        assert os.path.isdir(
-            self.models_dir
-        ), f"Models directory {self.models_dir} does not exist"
-        assert os.path.isdir(
-            self.splits_dir
-        ), f"Splits directory {self.splits_dir} does not exist"
-
-        # Setup fold ranges
-        self.start_fold = 0 if self.k_start == -1 else self.k_start
-        self.end_fold = self.k if self.k_end == -1 else self.k_end
-
-        # Setup folds to evaluate
-        if self.fold == -1:
-            self.folds = range(self.start_fold, self.end_fold)
-        else:
-            self.folds = range(self.fold, self.fold + 1)
-
-    def get_settings(self) -> Dict[str, Any]:
-        """Return settings dictionary for logging."""
-        return {
-            "task": self.task,
-            "split": self.split,
-            "save_dir": self.save_dir,
-            "models_dir": self.models_dir,
-            "models_exp_code": self.models_exp_code,
-            "model_type": self.model_type,
-            "drop_out": self.drop_out,
-            "model_size": self.model_size,
-            "k_folds_evaluated": list(self.folds),
-            "detailed_metrics": self.detailed_metrics,
-        }
-
-
 def setup_eval_dataset(config: EvalConfig) -> Generic_MIL_Dataset:
     """Setup dataset for evaluation based on configuration."""
     data_dir: str = os.path.join(config.data_root_dir, config.data_set_name)
 
-    if config.task == "task_1_tumor_vs_normal":
+    if config.task == TaskType.BINARY:
         dataset = Generic_MIL_Dataset(
             csv_path="dataset_csv/tumor_vs_normal_dummy_clean.csv",
             data_dir=data_dir,
@@ -169,13 +34,23 @@ def setup_eval_dataset(config: EvalConfig) -> Generic_MIL_Dataset:
             patient_strat=False,
             ignore=[],
         )
-    elif config.task == "task_2_tumor_subtyping":
+    elif config.task == TaskType.MULTICLASS:
         dataset = Generic_MIL_Dataset(
             csv_path="dataset_csv/tumor_subtyping_dummy_clean.csv",
             data_dir=data_dir,
             shuffle=False,
             print_info=True,
             label_dict={"subtype_1": 0, "subtype_2": 1, "subtype_3": 2},
+            patient_strat=False,
+            ignore=[],
+        )
+    elif config.task == TaskType.REGRESSION:
+        dataset = Generic_MIL_Dataset(
+            csv_path="dataset_csv/tumor_regression_dummy_clean.csv",
+            data_dir=data_dir,
+            shuffle=False,
+            print_info=True,
+            label_dict={},
             patient_strat=False,
             ignore=[],
         )

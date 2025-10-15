@@ -51,6 +51,69 @@ class SubsetSequentialSampler(Sampler):
         return len(self.indices)
 
 
+class DataLoaderFactory:
+    """Factory class for creating data loaders based on task type"""
+
+    @staticmethod
+    def create_data_loaders(config, train_split, val_split, test_split):
+        """Create data loaders for train, validation, and test splits"""
+
+        # Get task type from train_split (assuming all splits have same task)
+        task = getattr(train_split, "task", TaskType.BINARY)
+
+        print(f"Creating data loaders for task: {task.value}")
+
+        # Training loader
+        if train_split is not None:
+            train_loader = get_split_loader(
+                train_split, training=True, weighted=config.weighted_sample, task=task
+            )
+        else:
+            train_loader = None
+
+        # Validation loader
+        if val_split is not None:
+            val_loader = get_split_loader(val_split, training=False, task=task)
+        else:
+            val_loader = None
+
+        # Test loader
+        if test_split is not None:
+            test_loader = get_split_loader(test_split, testing=True, task=task)
+        else:
+            test_loader = None
+
+        return train_loader, val_loader, test_loader
+
+    @staticmethod
+    def get_simple_loader(dataset, task: TaskType, batch_size=1, num_workers=1):
+        kwargs = (
+            {"num_workers": 4, "pin_memory": False, "num_workers": num_workers}
+            if device.type == "cuda"
+            else {}
+        )
+        if task == TaskType.BINARY or task == TaskType.MULTICLASS:
+            loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                sampler=sampler.SequentialSampler(dataset),
+                collate_fn=collate_MIL_classification,
+                **kwargs,
+            )
+        elif task == TaskType.REGRESSION:
+            loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                sampler=sampler.SequentialSampler(dataset),
+                collate_fn=collate_MIL_regression,
+                **kwargs,
+            )
+        else:
+            raise Exception("Not support task exception!")
+
+        return loader
+
+
 def collate_MIL_classification(batch):
     """Collate function for classification tasks"""
     img = torch.cat([item[0] for item in batch], dim=0)
@@ -358,38 +421,3 @@ def seed_torch(seed: int = 7) -> None:
     # Configure CuDNN for deterministic results
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-
-
-class DataLoaderFactory:
-    """Factory class for creating data loaders based on task type"""
-
-    @staticmethod
-    def create_data_loaders(config, train_split, val_split, test_split):
-        """Create data loaders for train, validation, and test splits"""
-
-        # Get task type from train_split (assuming all splits have same task)
-        task = getattr(train_split, "task", TaskType.BINARY)
-
-        print(f"Creating data loaders for task: {task.value}")
-
-        # Training loader
-        if train_split is not None:
-            train_loader = get_split_loader(
-                train_split, training=True, weighted=config.weighted_sample, task=task
-            )
-        else:
-            train_loader = None
-
-        # Validation loader
-        if val_split is not None:
-            val_loader = get_split_loader(val_split, training=False, task=task)
-        else:
-            val_loader = None
-
-        # Test loader
-        if test_split is not None:
-            test_loader = get_split_loader(test_split, testing=True, task=task)
-        else:
-            test_loader = None
-
-        return train_loader, val_loader, test_loader
