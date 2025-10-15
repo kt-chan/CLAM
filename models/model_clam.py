@@ -321,6 +321,8 @@ class CLAM_SB_Regression(nn.Module):
         instance_loss_fn=nn.CrossEntropyLoss(),
         subtyping=False,
         embed_dim=1024,
+        min_score=3.0,
+        max_score=5.0,
     ):
         super().__init__()
         self.size_dict = {"small": [embed_dim, 512, 256], "big": [embed_dim, 512, 384]}
@@ -338,7 +340,7 @@ class CLAM_SB_Regression(nn.Module):
         # Regression output for primary and secondary Gleason patterns
         self.regressors = nn.Linear(size[1], 2)  # Output: [primary, secondary]
 
-        # Instance classifiers for pattern detection (now for regression guidance)
+        # Instance classifiers for pattern detection
         instance_classifiers = [
             nn.Linear(size[1], 2) for i in range(2)
         ]  # Two for primary/secondary pattern detection
@@ -347,6 +349,10 @@ class CLAM_SB_Regression(nn.Module):
         self.instance_loss_fn = instance_loss_fn
         self.n_classes = n_classes
         self.subtyping = subtyping
+
+        # Regression parameters
+        self.min_score = min_score
+        self.max_score = max_score
 
     @staticmethod
     def create_positive_targets(length, device):
@@ -422,44 +428,49 @@ class CLAM_SB_Regression(nn.Module):
                     classifier = self.instance_classifiers[i]
                     if inst_label == 1:  # Pattern present
                         instance_loss, preds, targets = self.inst_eval(A, h, classifier)
-                    else:  # Pattern not prominent,  Use negative sampling or alternative approach
-                        instance_loss, preds, targets = self.inst_eval_out(A, h, classifier)
+                    else:  # Pattern not prominent
+                        instance_loss, preds, targets = self.inst_eval_out(
+                            A, h, classifier
+                        )
 
                     all_preds.extend(preds.cpu().numpy())
                     all_targets.extend(targets.cpu().numpy())
                     total_inst_loss += instance_loss
 
-            if self.subtyping:
-                total_inst_loss /= len(self.instance_classifiers)
+                if self.subtyping:
+                    total_inst_loss /= len(self.instance_classifiers)
 
         M = torch.mm(A, h)
 
         # Regression output for primary and secondary patterns
         pattern_logits = self.regressors(M)  # [primary, secondary]
 
-        # Apply constraints: primary >= secondary, both between 3-5
-        primary = pattern_logits[0, 0]
-        secondary = pattern_logits[0, 1]
+        # Apply max/min constraint - ALWAYS differentiable
+        primary_raw = pattern_logits[0, 0]
+        secondary_raw = pattern_logits[0, 1]
 
-        # Ensure primary >= secondary
-        constraint_loss = None
-        if self.training:
-            # Soft constraint with gradient flow
-            diff = secondary - primary
-            constraint_loss = F.relu(diff)  # Penalize if secondary > primary
+        # Primary = max, Secondary = min (ensures primary >= secondary)
+        primary_constrained = torch.max(primary_raw, secondary_raw)
+        secondary_constrained = torch.min(primary_raw, secondary_raw)
+
+        # Replace with constrained values
+        pattern_logits = torch.stack(
+            [primary_constrained, secondary_constrained]
+        ).unsqueeze(0)
+
+        # Apply sigmoid to get values between 0-1, then scale to min_score-max_score range
+        pattern_values = (
+            torch.sigmoid(pattern_logits) * (self.max_score - self.min_score)
+            + self.min_score
+        )
+
+        # For final predictions - round to integers during inference
+        if not self.training:
+            pattern_predictions = torch.round(
+                pattern_values
+            )  # Gets integer scores 3,4,5
         else:
-            # Hard constraint for inference
-            if secondary > primary:
-                pattern_logits[0, 0], pattern_logits[0, 1] = (
-                    pattern_logits[0, 1],
-                    pattern_logits[0, 0],
-                )
-
-        # Apply sigmoid to get values between 0-1, then scale to 3-5 range
-        pattern_values = torch.sigmoid(pattern_logits) * 2 + 3  # Scale to [3,5] range
-
-        # For continuous regression, predictions are the same as values
-        pattern_predictions = pattern_values  # Continuous predictions
+            pattern_predictions = pattern_values  # Keep continuous for gradient flow
 
         if instance_eval:
             results_dict = {
@@ -467,8 +478,6 @@ class CLAM_SB_Regression(nn.Module):
                 "inst_labels": np.array(all_targets),
                 "inst_preds": np.array(all_preds),
             }
-            if constraint_loss is not None:
-                results_dict["constraint_loss"] = constraint_loss
         else:
             results_dict = {}
         if return_features:
@@ -488,6 +497,8 @@ class CLAM_MB_Regression(CLAM_SB_Regression):
         instance_loss_fn=nn.CrossEntropyLoss(),
         subtyping=False,
         embed_dim=1024,
+        min_score=3.0,
+        max_score=5.0,
     ):
         nn.Module.__init__(self)
         self.size_dict = {"small": [embed_dim, 512, 256], "big": [embed_dim, 512, 384]}
@@ -496,7 +507,7 @@ class CLAM_MB_Regression(CLAM_SB_Regression):
         if gate:
             attention_net = Attn_Net_Gated(
                 L=size[1], D=size[2], dropout=dropout, n_classes=2
-            )  # Two for primary/secondary
+            )  # Two attention heads for primary/secondary
         else:
             attention_net = Attn_Net(L=size[1], D=size[2], dropout=dropout, n_classes=2)
         fc.append(attention_net)
@@ -514,6 +525,10 @@ class CLAM_MB_Regression(CLAM_SB_Regression):
         self.instance_loss_fn = instance_loss_fn
         self.n_classes = n_classes
         self.subtyping = subtyping
+
+        # Regression parameters
+        self.min_score = min_score
+        self.max_score = max_score
 
     def forward(
         self,
@@ -547,13 +562,16 @@ class CLAM_MB_Regression(CLAM_SB_Regression):
                     inst_label = inst_labels[i].item()
                     classifier = self.instance_classifiers[i]
 
-                    # ALWAYS compute instance loss, regardless of pattern prominence
+                    # Use corresponding attention head for each pattern
+                    pattern_attention = A[i] if i < A.shape[0] else A[0]
+
                     if inst_label == 1:  # Pattern present
-                        instance_loss, preds, targets = self.inst_eval(A, h, classifier)
-                    else:  # Pattern not prominent - still compute but with different strategy
-                        # Use negative sampling or alternative approach
+                        instance_loss, preds, targets = self.inst_eval(
+                            pattern_attention, h, classifier
+                        )
+                    else:  # Pattern not prominent
                         instance_loss, preds, targets = self.inst_eval_out(
-                            A, h, classifier
+                            pattern_attention, h, classifier
                         )
 
                     all_preds.extend(preds.cpu().numpy())
@@ -574,22 +592,30 @@ class CLAM_MB_Regression(CLAM_SB_Regression):
         # Combine into final output
         pattern_logits = torch.cat([primary_logit, secondary_logit], dim=1)
 
-        # Apply constraints and scaling
-        primary = pattern_logits[0, 0]
-        secondary = pattern_logits[0, 1]
+        # Apply max/min constraint - ALWAYS differentiable
+        primary_raw = pattern_logits[0, 0]
+        secondary_raw = pattern_logits[0, 1]
 
-        constraint_loss = None
-        if self.training:
-            diff = secondary - primary
-            constraint_loss = F.relu(diff)
+        # Primary = max, Secondary = min (ensures primary >= secondary)
+        primary_constrained = torch.max(primary_raw, secondary_raw)
+        secondary_constrained = torch.min(primary_raw, secondary_raw)
+
+        # Replace with constrained values
+        pattern_logits = torch.stack(
+            [primary_constrained, secondary_constrained]
+        ).unsqueeze(0)
+
+        # Scale to Gleason score range
+        pattern_values = (
+            torch.sigmoid(pattern_logits) * (self.max_score - self.min_score)
+            + self.min_score
+        )
+
+        # Round to integers during inference
+        if not self.training:
+            pattern_predictions = torch.round(pattern_values)
         else:
-            if secondary > primary:
-                pattern_logits[0, 0], pattern_logits[0, 1] = (
-                    pattern_logits[0, 1],
-                    pattern_logits[0, 0],
-                )
-
-        pattern_probs = torch.sigmoid(pattern_logits) * 2 + 3  # Scale to [3,5] range
+            pattern_predictions = pattern_values
 
         if instance_eval:
             results_dict = {
@@ -597,8 +623,6 @@ class CLAM_MB_Regression(CLAM_SB_Regression):
                 "inst_labels": np.array(all_targets),
                 "inst_preds": np.array(all_preds),
             }
-            if constraint_loss is not None:
-                results_dict["constraint_loss"] = constraint_loss
         else:
             results_dict = {}
         if return_features:
@@ -606,7 +630,7 @@ class CLAM_MB_Regression(CLAM_SB_Regression):
                 {"features_primary": M_primary, "features_secondary": M_secondary}
             )
 
-        return pattern_logits, pattern_probs, pattern_probs, A_raw, results_dict
+        return pattern_logits, pattern_values, pattern_predictions, A_raw, results_dict
 
 
 def extract_pattern_labels(label):
@@ -617,7 +641,7 @@ def extract_pattern_labels(label):
     # Handle different label formats
     if isinstance(label, torch.Tensor):
         if label.numel() == 1:
-            # Single value
+            # Single value - assume both patterns same
             primary_value = label.item()
             secondary_value = primary_value
         else:
@@ -638,7 +662,7 @@ def extract_pattern_labels(label):
         primary_value = float(label)
         secondary_value = primary_value
 
-    # Convert to binary labels for pattern detection
+    # Convert to binary labels for pattern detection (≥3 = clinically significant)
     primary_label = 1 if primary_value >= 3 else 0
     secondary_label = 1 if secondary_value >= 3 else 0
 

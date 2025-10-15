@@ -627,7 +627,6 @@ class MetricsCalculator:
         train_loss: float,
         train_error: float,
         train_inst_loss: float,
-        train_constraint_loss: float,
         metrics_logger: BaseMetricsLogger,
         n_classes: int,
         writer: Optional[Any] = None,
@@ -638,11 +637,6 @@ class MetricsCalculator:
 
         if train_inst_loss > 0:  # Only log if instance loss is used
             mlflow.log_metric("train_clustering_loss", train_inst_loss, step=epoch)
-
-        if train_constraint_loss > 0:  # Only log if instance loss is used
-            mlflow.log_metric(
-                "train_constraint_loss", train_constraint_loss, step=epoch
-            )
 
         # Log task-specific metrics
         all_metrics = metrics_logger.get_all_metrics()
@@ -742,7 +736,6 @@ class MetricsCalculator:
                     mlflow.log_metric(f"final_test_class_{i}_acc", acc)
 
 
-# ==================== FACTORY CLASSES ====================
 # ==================== FACTORY CLASSES ====================
 class ModelFactory:
     """Factory class for creating models and loss functions"""
@@ -847,6 +840,13 @@ class ModelFactory:
             elif config.model_type == "clam_mb":
                 return CLAM_MB(**model_dict, instance_loss_fn=instance_loss_fn)
         elif config.task == TaskType.REGRESSION:
+            # Add regression-specific parameters
+            regression_params = {
+                "min_score": 3.0,  # Default Gleason min
+                "max_score": 5.0,  # Default Gleason max
+            }
+            model_dict.update(regression_params)
+
             if config.model_type == "clam_sb" or config.model_type == "clam_sbr":
                 return CLAM_SB_Regression(
                     **model_dict, instance_loss_fn=instance_loss_fn
@@ -1139,14 +1139,12 @@ class StandardMILTrainingStrategy(TrainingStrategy):
         return False
 
 
-# training code
 class CLAMTrainingStrategy(TrainingStrategy):
     """Training strategy for CLAM models with instance-level clustering"""
 
-    def __init__(self, bag_weight: float = 0.7, alpha: float = 0.7, beta: float = 0.1):
+    def __init__(self, bag_weight: float = 0.7):
         self.bag_weight = bag_weight
-        self.alpha = alpha  # Weight for instance loss
-        self.beta = beta  # Weight for constraint loss
+        # Removed alpha parameter - instance loss is handled internally by the model
 
     def train_epoch(
         self,
@@ -1167,9 +1165,7 @@ class CLAMTrainingStrategy(TrainingStrategy):
         train_loss = 0.0
         train_error = 0.0
         train_inst_loss = 0.0
-        train_constraint_loss = 0.0
         inst_count = 0
-        constraint_count = 0
 
         print(f"\nTraining Epoch: {epoch}")
 
@@ -1190,33 +1186,15 @@ class CLAMTrainingStrategy(TrainingStrategy):
                 # For classification, use logits
                 bag_loss = loss_fn(logits, label)
 
-            # Extract instance loss and constraint loss
+            # Extract instance loss (constraint loss is no longer returned)
             instance_loss = results_dict.get("instance_loss", 0.0)
-            constraint_loss = results_dict.get("constraint_loss", 0.0)
 
             # Ensure Y_hat is available
             if Y_hat is None:
                 Y_hat = Y_prob
 
-            # Calculate total loss with appropriate weighting
-            total_loss = bag_loss
-
-            # Add instance loss if present
-            if isinstance(instance_loss, torch.Tensor) and instance_loss.numel() > 0:
-                total_loss = total_loss + self.alpha * instance_loss
-                inst_count += 1
-
-            # Add constraint loss if present (mainly for regression)
-            if (
-                isinstance(constraint_loss, torch.Tensor)
-                and constraint_loss.numel() > 0
-            ):
-                total_loss = total_loss + self.beta * constraint_loss
-                constraint_count += 1
-
-            # Backward pass
-            total_loss.backward()
-            optimizer.step()
+            # Calculate total loss - instance loss is already included in the model's forward pass
+            total_loss = bag_loss + instance_loss
 
             # Update metrics
             train_loss += total_loss.item()
@@ -1227,13 +1205,8 @@ class CLAMTrainingStrategy(TrainingStrategy):
             else:
                 instance_loss_value = float(instance_loss)
 
-            if isinstance(constraint_loss, torch.Tensor):
-                constraint_loss_value = constraint_loss.item()
-            else:
-                constraint_loss_value = float(constraint_loss)
-
             train_inst_loss += instance_loss_value
-            train_constraint_loss += constraint_loss_value
+            inst_count += 1
 
             error = calculate_error(Y_hat, label, task_type)
             train_error += error
@@ -1241,13 +1214,14 @@ class CLAMTrainingStrategy(TrainingStrategy):
             # Log batch metrics
             metrics_logger.log_batch(Y_hat, label)
 
+            # Backward pass
+            total_loss.backward()
+            optimizer.step()
+
         # Calculate epoch averages
         train_loss /= len(loader)
         train_error /= len(loader)
         train_inst_loss = train_inst_loss / inst_count if inst_count > 0 else 0.0
-        train_constraint_loss = (
-            train_constraint_loss / constraint_count if constraint_count > 0 else 0.0
-        )
 
         # Log using MetricsCalculator
         MetricsCalculator.log_training_metrics(
@@ -1255,17 +1229,10 @@ class CLAMTrainingStrategy(TrainingStrategy):
             train_loss=train_loss,
             train_error=train_error,
             train_inst_loss=train_inst_loss,
-            train_constraint_loss=train_constraint_loss,
             metrics_logger=metrics_logger,
             n_classes=n_classes,
             writer=writer,
         )
-
-        # Log constraint loss for regression if present
-        if task_type == TaskType.REGRESSION and constraint_count > 0:
-            print(f"Train Constraint Loss: {train_constraint_loss:.4f}")
-            if writer:
-                writer.add_scalar("train/constraint_loss", train_constraint_loss, epoch)
 
     def validate(
         self,
@@ -1288,9 +1255,7 @@ class CLAMTrainingStrategy(TrainingStrategy):
         val_loss = 0.0
         val_error = 0.0
         val_inst_loss = 0.0
-        val_constraint_loss = 0.0
         inst_count = 0
-        constraint_count = 0
 
         # For metrics calculation
         all_probs = []
@@ -1312,32 +1277,15 @@ class CLAMTrainingStrategy(TrainingStrategy):
                 else:
                     bag_loss = loss_fn(logits, label)
 
-                # Extract instance loss and constraint loss (constrain loss is always zero for validation, which is enforced)
+                # Extract instance loss (constraint loss is no longer returned)
                 instance_loss = results_dict.get("instance_loss", 0.0)
-                constraint_loss = results_dict.get("constraint_loss", 0.0)
 
                 # Ensure Y_hat is available
                 if Y_hat is None:
                     Y_hat = Y_prob
 
-                # Calculate total loss with appropriate weighting
-                total_loss = bag_loss
-
-                # Add instance loss if present
-                if (
-                    isinstance(instance_loss, torch.Tensor)
-                    and instance_loss.numel() > 0
-                ):
-                    total_loss = total_loss + self.alpha * instance_loss
-                    inst_count += 1
-
-                # Add constraint loss if present (mainly for regression)
-                if (
-                    isinstance(constraint_loss, torch.Tensor)
-                    and constraint_loss.numel() > 0
-                ):
-                    total_loss = total_loss + self.beta * constraint_loss
-                    constraint_count += 1
+                # Calculate total loss - instance loss is already included
+                total_loss = bag_loss + instance_loss
 
                 # Convert losses to scalars safely
                 if isinstance(instance_loss, torch.Tensor):
@@ -1345,14 +1293,9 @@ class CLAMTrainingStrategy(TrainingStrategy):
                 else:
                     instance_loss_value = float(instance_loss)
 
-                if isinstance(constraint_loss, torch.Tensor):
-                    constraint_loss_value = constraint_loss.item()
-                else:
-                    constraint_loss_value = float(constraint_loss)
-
                 val_loss += total_loss.item()
                 val_inst_loss += instance_loss_value
-                val_constraint_loss += constraint_loss_value
+                inst_count += 1
 
                 error = calculate_error(Y_hat, label, task_type)
                 val_error += error
@@ -1372,9 +1315,6 @@ class CLAMTrainingStrategy(TrainingStrategy):
         val_loss /= len(loader)
         val_error /= len(loader)
         val_inst_loss = val_inst_loss / inst_count if inst_count > 0 else 0.0
-        val_constraint_loss = (
-            val_constraint_loss / constraint_count if constraint_count > 0 else 0.0
-        )
 
         # Prepare data for metrics calculation
         all_labels_np = np.concatenate(all_labels)
@@ -1412,8 +1352,6 @@ class CLAMTrainingStrategy(TrainingStrategy):
         )
         if auc is not None:
             print_str += f", Val AUC: {auc:.4f}"
-        if task_type == TaskType.REGRESSION and constraint_count > 0:
-            print_str += f", Val Constraint Loss: {val_constraint_loss:.4f}"
         print(print_str)
 
         # Log validation metrics using MetricsCalculator
@@ -1427,10 +1365,6 @@ class CLAMTrainingStrategy(TrainingStrategy):
             writer=writer,
             task_type=task_type,
         )
-
-        # Log constraint loss for regression if present
-        if task_type == TaskType.REGRESSION and constraint_count > 0 and writer:
-            writer.add_scalar("val/constraint_loss", val_constraint_loss, epoch)
 
         # Early stopping
         if early_stopping and results_dir:
@@ -1456,7 +1390,10 @@ class TrainingStrategyFactory:
     @staticmethod
     def create_strategy(config: MILTrainingConfig) -> TrainingStrategy:
         """Create appropriate training strategy based on configuration"""
-        if config.model_type in ["clam_sb", "clam_mb"] and not config.no_inst_cluster:
+        if (
+            config.model_type in ["clam_sb", "clam_mb", "clam_sbr", "clam_mbr"]
+            and not config.no_inst_cluster
+        ):
             return CLAMTrainingStrategy(bag_weight=config.bag_weight)
         else:
             return StandardMILTrainingStrategy()
@@ -1579,8 +1516,7 @@ class ModelEvaluator:
         return patient_results, test_error, auc, metrics_logger
 
 
-
-# ==================== MODEL MANAGER ====================
+# ==================== UPDATED MODEL MANAGER ====================
 class ModelManager:
     """Manages model reconstruction and MLflow registration"""
 
@@ -1644,8 +1580,8 @@ class ModelManager:
     @staticmethod
     def log_best_model_to_mlflow(
         config: MILTrainingConfig,
-        all_val_auc: List[float],
-        all_test_auc: List[float],
+        all_val_metrics: List[float],
+        all_test_metrics: List[float],
         folds: np.ndarray,
         dataset: Generic_MIL_Dataset,
     ) -> Optional[torch.nn.Module]:
@@ -1654,14 +1590,24 @@ class ModelManager:
             print("Model registration is disabled. Skipping...")
             return None
 
-        # Find the best fold
-        best_fold_idx = np.argmax(all_val_auc)
+        # Find the best fold based on task type
+        if config.task == TaskType.REGRESSION:
+            # For regression, lower MAE is better
+            best_fold_idx = np.argmin(all_val_metrics)
+            best_val_metric = all_val_metrics[best_fold_idx]
+            best_test_metric = all_test_metrics[best_fold_idx]
+            metric_name = "MAE"
+        else:
+            # For classification, higher AUC is better
+            best_fold_idx = np.argmax(all_val_metrics)
+            best_val_metric = all_val_metrics[best_fold_idx]
+            best_test_metric = all_test_metrics[best_fold_idx]
+            metric_name = "AUC"
+
         best_fold = folds[best_fold_idx]
-        best_val_auc = all_val_auc[best_fold_idx]
-        best_test_auc = all_test_auc[best_fold_idx]
 
         print(
-            f"Best model from fold {best_fold} with validation AUC: {best_val_auc:.4f}"
+            f"Best model from fold {best_fold} with validation {metric_name}: {best_val_metric:.4f}"
         )
 
         # Load the best model
@@ -1711,14 +1657,14 @@ class ModelManager:
             )
 
             print(f"✅ Successfully registered model: {config.registered_model_name}")
-            print(f"   - Best validation AUC: {best_val_auc:.4f}")
-            print(f"   - Best test AUC: {best_test_auc:.4f}")
+            print(f"   - Best validation {metric_name}: {best_val_metric:.4f}")
+            print(f"   - Best test {metric_name}: {best_test_metric:.4f}")
             print(f"   - From fold: {best_fold}")
 
             # Log additional metrics
             mlflow.set_tag("best_model_fold", str(best_fold))
-            mlflow.log_metric("best_val_auc", best_val_auc)
-            mlflow.log_metric("best_test_auc", best_test_auc)
+            mlflow.log_metric(f"best_val_{metric_name.lower()}", best_val_metric)
+            mlflow.log_metric(f"best_test_{metric_name.lower()}", best_test_metric)
 
             return best_model
 
@@ -1727,7 +1673,7 @@ class ModelManager:
             return None
 
 
-# ==================== SINGLE FOLD TRAINER ====================
+# ==================== UPDATED SINGLE FOLD TRAINER ====================
 class FoldTrainer:
     """Handles training for a single fold"""
 
@@ -1889,7 +1835,6 @@ class FoldTrainer:
 
         return stop_training
 
-    # _final_evaluation code
     def _final_evaluation(
         self, model: nn.Module, val_loader: Any, test_loader: Any
     ) -> FoldResults:
@@ -1899,52 +1844,53 @@ class FoldTrainer:
         is_regression = self.config.task == TaskType.REGRESSION
 
         # --- Validation evaluation ---
-        # ModelEvaluator.summary is assumed to return:
-        # (results_dict, primary_metric_value, secondary_metric_value, metrics_logger)
-        # For classification: (..., error, auc, ...)
-        # For regression: (..., primary_metric, None, ...) -> We will use MAE as primary metric
-        _, val_error, val_auc, val_metrics_logger = ModelEvaluator.summary(
+        val_results, val_error, val_auc, val_metrics_logger = ModelEvaluator.summary(
             model, val_loader, self.config.n_classes, self.config.task
         )
 
-        # Select the primary metric to print based on task
-        if is_regression:
-            val_mae = val_metrics_logger.get_all_metrics().get("mae", val_error)
-            val_metric_str = f"MAE: {val_mae:.4f}, Error (Loss): {val_error:.4f}"
-            val_auc = None  # Explicitly clear AUC for printing/logging
-        else:
-            val_metric_str = f"Error: {val_error:.4f}" + (
-                f", ROC AUC: {val_auc:.4f}" if val_auc is not None else ""
-            )
-
-        print(f"Val {val_metric_str}")
-
         # --- Test evaluation ---
-        results_dict, test_error, test_auc, test_metrics_logger = (
+        test_results, test_error, test_auc, test_metrics_logger = (
             ModelEvaluator.summary(
                 model, test_loader, self.config.n_classes, self.config.task
             )
         )
 
+        # Get comprehensive metrics
+        val_metrics = val_metrics_logger.get_all_metrics()
+        test_metrics = test_metrics_logger.get_all_metrics()
+
         # Select the primary metric to print based on task
         if is_regression:
-            test_mae = test_metrics_logger.get_all_metrics().get("mae", test_error)
+            val_mae = val_metrics.get("mae", val_error)
+            test_mae = test_metrics.get("mae", test_error)
+
+            val_metric_str = f"MAE: {val_mae:.4f}, Error (Loss): {val_error:.4f}"
             test_metric_str = f"MAE: {test_mae:.4f}, Error (Loss): {test_error:.4f}"
-            test_auc = None  # Explicitly clear AUC for printing/logging
+
+            # Log additional regression metrics
+            val_mse = val_metrics.get("mse", 0.0)
+            val_r2 = val_metrics.get("r2", 0.0)
+            test_mse = test_metrics.get("mse", 0.0)
+            test_r2 = test_metrics.get("r2", 0.0)
+
+            print(f"Val {val_metric_str}, MSE: {val_mse:.4f}, R²: {val_r2:.4f}")
+            print(f"Test {test_metric_str}, MSE: {test_mse:.4f}, R²: {test_r2:.4f}")
         else:
+            val_metric_str = f"Error: {val_error:.4f}" + (
+                f", ROC AUC: {val_auc:.4f}" if val_auc is not None else ""
+            )
             test_metric_str = f"Error: {test_error:.4f}" + (
                 f", ROC AUC: {test_auc:.4f}" if test_auc is not None else ""
             )
-
-        print(f"Test {test_metric_str}")
+            print(f"Val {val_metric_str}")
+            print(f"Test {test_metric_str}")
 
         # --- Log final metrics ---
-        # Note: Log final metrics should handle the task type internally.
         MetricsCalculator.log_final_metrics(
             val_error,
-            val_auc,  # Pass None if regression
+            val_auc,
             test_error,
-            test_auc,  # Pass None if regression
+            test_auc,
             test_metrics_logger,
             self.config.n_classes,
             self.config.task,
@@ -1955,31 +1901,37 @@ class FoldTrainer:
             self.writer.close()
 
         # --- Return Results ---
-        # The 'acc' key is repurposed to store MAE for regression
-        val_primary_result = (
-            val_metrics_logger.get_all_metrics().get("mae", 0.0)
-            if is_regression
-            else (1.0 - val_error)
-        )
-        test_primary_result = (
-            test_metrics_logger.get_all_metrics().get("mae", 0.0)
-            if is_regression
-            else (1.0 - test_error)
-        )
+        if is_regression:
+            return {
+                "results_dict": test_results,
+                "test_mae": test_mae,
+                "val_mae": val_mae,
+                "test_mse": test_mse,
+                "val_mse": val_mse,
+                "test_r2": test_r2,
+                "val_r2": val_r2,
+                "test_auc": 0.0,  # Placeholder for compatibility
+                "val_auc": 0.0,  # Placeholder for compatibility
+                "test_acc": test_mae,  # Repurpose acc field for MAE
+                "val_acc": val_mae,  # Repurpose acc field for MAE
+            }
+        else:
+            return {
+                "results_dict": test_results,
+                "test_auc": test_auc if test_auc is not None else 0.0,
+                "val_auc": val_auc if val_auc is not None else 0.0,
+                "test_acc": 1.0 - test_error,  # Convert error to accuracy
+                "val_acc": 1.0 - val_error,  # Convert error to accuracy
+                "test_mae": 0.0,  # Placeholder for compatibility
+                "val_mae": 0.0,  # Placeholder for compatibility
+                "test_mse": 0.0,  # Placeholder for compatibility
+                "val_mse": 0.0,  # Placeholder for compatibility
+                "test_r2": 0.0,  # Placeholder for compatibility
+                "val_r2": 0.0,  # Placeholder for compatibility
+            }
 
-        return {
-            "results_dict": results_dict,
-            "test_auc": test_auc if test_auc is not None else 0.0,
-            "val_auc": val_auc if val_auc is not None else 0.0,
-            # For classification, return 1 - Error (Accuracy).
-            # For regression, return MAE.
-            "test_acc": test_primary_result,
-            "val_acc": val_primary_result,
-        }
 
-
-
-# ==================== MAIN TRAINING ORCHESTRATOR ====================
+# ==================== UPDATED CROSS-VALIDATION TRAINER ====================
 class CrossValidationTrainer:
     """Main orchestrator for cross-validation training"""
 
@@ -2037,20 +1989,73 @@ class CrossValidationTrainer:
             # Log final results
             self._log_final_results(results)
 
-            # Register best model
+            # Register best model with appropriate metrics
+            if self.config.task == TaskType.REGRESSION:
+                val_metrics = results["val_mae"]
+                test_metrics = results["test_mae"]
+            else:
+                val_metrics = results["val_auc"]
+                test_metrics = results["test_auc"]
+
             best_model = ModelManager.log_best_model_to_mlflow(
                 self.config,
-                results["val_auc"],
-                results["test_auc"],
+                val_metrics,
+                test_metrics,
                 results["folds"],
                 self.dataset,
             )
 
             return TrainingResults(
-                test_auc=results["test_auc"],
-                val_auc=results["val_auc"],
-                test_acc=results["test_acc"],
-                val_acc=results["val_acc"],
+                test_auc=(
+                    results["test_auc"]
+                    if self.config.task != TaskType.REGRESSION
+                    else None
+                ),
+                val_auc=(
+                    results["val_auc"]
+                    if self.config.task != TaskType.REGRESSION
+                    else None
+                ),
+                test_acc=(
+                    results["test_acc"]
+                    if self.config.task != TaskType.REGRESSION
+                    else None
+                ),
+                val_acc=(
+                    results["val_acc"]
+                    if self.config.task != TaskType.REGRESSION
+                    else None
+                ),
+                test_mae=(
+                    results["test_mae"]
+                    if self.config.task == TaskType.REGRESSION
+                    else None
+                ),
+                val_mae=(
+                    results["val_mae"]
+                    if self.config.task == TaskType.REGRESSION
+                    else None
+                ),
+                test_mse=(
+                    results["test_mse"]
+                    if self.config.task == TaskType.REGRESSION
+                    else None
+                ),
+                val_mse=(
+                    results["val_mse"]
+                    if self.config.task == TaskType.REGRESSION
+                    else None
+                ),
+                test_r2=(
+                    results["test_r2"]
+                    if self.config.task == TaskType.REGRESSION
+                    else None
+                ),
+                val_r2=(
+                    results["val_r2"]
+                    if self.config.task == TaskType.REGRESSION
+                    else None
+                ),
                 final_df=results["final_df"],
                 best_model=best_model,
                 mlflow_run_id=run.info.run_id,
@@ -2058,10 +2063,29 @@ class CrossValidationTrainer:
 
     def _train_all_folds(self) -> Dict[str, Any]:
         """Train all folds and collect results"""
-        all_test_auc: List[float] = []
-        all_val_auc: List[float] = []
-        all_test_acc: List[float] = []
-        all_val_acc: List[float] = []
+        # Initialize lists for metrics based on task type
+        if self.config.task == TaskType.REGRESSION:
+            all_test_mae: List[float] = []
+            all_val_mae: List[float] = []
+            all_test_mse: List[float] = []
+            all_val_mse: List[float] = []
+            all_test_r2: List[float] = []
+            all_val_r2: List[float] = []
+            all_test_auc: List[float] = []  # Placeholder
+            all_val_auc: List[float] = []  # Placeholder
+            all_test_acc: List[float] = []  # Repurposed as MAE
+            all_val_acc: List[float] = []  # Repurposed as MAE
+        else:
+            all_test_auc: List[float] = []
+            all_val_auc: List[float] = []
+            all_test_acc: List[float] = []
+            all_val_acc: List[float] = []
+            all_test_mae: List[float] = []  # Placeholder
+            all_val_mae: List[float] = []  # Placeholder
+            all_test_mse: List[float] = []  # Placeholder
+            all_val_mse: List[float] = []  # Placeholder
+            all_test_r2: List[float] = []  # Placeholder
+            all_val_r2: List[float] = []  # Placeholder
 
         folds = np.arange(self.config.start_fold, self.config.end_fold)
 
@@ -2078,11 +2102,29 @@ class CrossValidationTrainer:
             fold_trainer = FoldTrainer(self.config, fold_idx, folds.size)
             fold_results = fold_trainer.train(datasets)
 
-            # Collect results
-            all_test_auc.append(fold_results["test_auc"])
-            all_val_auc.append(fold_results["val_auc"])
-            all_test_acc.append(fold_results["test_acc"])
-            all_val_acc.append(fold_results["val_acc"])
+            # Collect results based on task type
+            if self.config.task == TaskType.REGRESSION:
+                all_test_mae.append(fold_results["test_mae"])
+                all_val_mae.append(fold_results["val_mae"])
+                all_test_mse.append(fold_results["test_mse"])
+                all_val_mse.append(fold_results["val_mse"])
+                all_test_r2.append(fold_results["test_r2"])
+                all_val_r2.append(fold_results["val_r2"])
+                all_test_acc.append(fold_results["test_acc"])  # MAE
+                all_val_acc.append(fold_results["val_acc"])  # MAE
+                all_test_auc.append(0.0)  # Placeholder
+                all_val_auc.append(0.0)  # Placeholder
+            else:
+                all_test_auc.append(fold_results["test_auc"])
+                all_val_auc.append(fold_results["val_auc"])
+                all_test_acc.append(fold_results["test_acc"])
+                all_val_acc.append(fold_results["val_acc"])
+                all_test_mae.append(0.0)  # Placeholder
+                all_val_mae.append(0.0)  # Placeholder
+                all_test_mse.append(0.0)  # Placeholder
+                all_val_mse.append(0.0)  # Placeholder
+                all_test_r2.append(0.0)  # Placeholder
+                all_val_r2.append(0.0)  # Placeholder
 
             # Save results for this fold
             filename = os.path.join(
@@ -2090,18 +2132,49 @@ class CrossValidationTrainer:
             )
             save_pkl(filename, fold_results["results_dict"])
 
-        return {
-            "folds": folds,
-            "test_auc": all_test_auc,
-            "val_auc": all_val_auc,
-            "test_acc": all_test_acc,
-            "val_acc": all_val_acc,
-            "final_df": self._create_summary_dataframe(
-                folds, all_test_auc, all_val_auc, all_test_acc, all_val_acc
-            ),
-        }
+        # Prepare results dictionary
+        if self.config.task == TaskType.REGRESSION:
+            return {
+                "folds": folds,
+                "test_mae": all_test_mae,
+                "val_mae": all_val_mae,
+                "test_mse": all_test_mse,
+                "val_mse": all_val_mse,
+                "test_r2": all_test_r2,
+                "val_r2": all_val_r2,
+                "test_auc": all_test_auc,
+                "val_auc": all_val_auc,
+                "test_acc": all_test_acc,
+                "val_acc": all_val_acc,
+                "final_df": self._create_summary_dataframe_regression(
+                    folds,
+                    all_test_mae,
+                    all_val_mae,
+                    all_test_mse,
+                    all_val_mse,
+                    all_test_r2,
+                    all_val_r2,
+                ),
+            }
+        else:
+            return {
+                "folds": folds,
+                "test_auc": all_test_auc,
+                "val_auc": all_val_auc,
+                "test_acc": all_test_acc,
+                "val_acc": all_val_acc,
+                "test_mae": all_test_mae,
+                "val_mae": all_val_mae,
+                "test_mse": all_test_mse,
+                "val_mse": all_val_mse,
+                "test_r2": all_test_r2,
+                "val_r2": all_val_r2,
+                "final_df": self._create_summary_dataframe_classification(
+                    folds, all_test_auc, all_val_auc, all_test_acc, all_val_acc
+                ),
+            }
 
-    def _create_summary_dataframe(
+    def _create_summary_dataframe_classification(
         self,
         folds: np.ndarray,
         all_test_auc: List[float],
@@ -2109,7 +2182,7 @@ class CrossValidationTrainer:
         all_test_acc: List[float],
         all_val_acc: List[float],
     ) -> pd.DataFrame:
-        """Create and save summary dataframe"""
+        """Create and save summary dataframe for classification tasks"""
         final_df = pd.DataFrame(
             {
                 "folds": folds,
@@ -2117,6 +2190,39 @@ class CrossValidationTrainer:
                 "val_auc": all_val_auc,
                 "test_acc": all_test_acc,
                 "val_acc": all_val_acc,
+            }
+        )
+
+        save_name = (
+            f"summary_partial_{self.config.start_fold}_{self.config.end_fold}.csv"
+            if len(folds) != self.config.k
+            else "summary.csv"
+        )
+        final_summary_path = os.path.join(self.config.results_dir, save_name)
+        final_df.to_csv(final_summary_path)
+
+        return final_df
+
+    def _create_summary_dataframe_regression(
+        self,
+        folds: np.ndarray,
+        all_test_mae: List[float],
+        all_val_mae: List[float],
+        all_test_mse: List[float],
+        all_val_mse: List[float],
+        all_test_r2: List[float],
+        all_val_r2: List[float],
+    ) -> pd.DataFrame:
+        """Create and save summary dataframe for regression tasks"""
+        final_df = pd.DataFrame(
+            {
+                "folds": folds,
+                "test_mae": all_test_mae,
+                "val_mae": all_val_mae,
+                "test_mse": all_test_mse,
+                "val_mse": all_val_mse,
+                "test_r2": all_test_r2,
+                "val_r2": all_val_r2,
             }
         )
 
@@ -2148,13 +2254,65 @@ class CrossValidationTrainer:
         )
         mlflow.log_artifact(final_summary_path)
 
-        # Log final metrics
+        # Log metrics based on task type
+        if self.config.task == TaskType.REGRESSION:
+            self._log_regression_metrics(results)
+        else:
+            self._log_classification_metrics(results)
+
+    def _log_classification_metrics(self, results: Dict[str, Any]) -> None:
+        """Log classification metrics to MLflow"""
         mlflow.log_metric("CV_Test_AUC_Mean", float(np.mean(results["test_auc"])))
         mlflow.log_metric("CV_Test_AUC_Std", float(np.std(results["test_auc"])))
         mlflow.log_metric("CV_Test_Accuracy_Mean", float(np.mean(results["test_acc"])))
         mlflow.log_metric("CV_Test_Accuracy_Std", float(np.std(results["test_acc"])))
         mlflow.log_metric("CV_Val_AUC_Mean", float(np.mean(results["val_auc"])))
         mlflow.log_metric("CV_Val_AUC_Std", float(np.std(results["val_auc"])))
+
+        print("\n################# Final Classification Results ###################")
+        print(
+            f"CV Test AUC: {np.mean(results['test_auc']):.4f} ± {np.std(results['test_auc']):.4f}"
+        )
+        print(
+            f"CV Test Accuracy: {np.mean(results['test_acc']):.4f} ± {np.std(results['test_acc']):.4f}"
+        )
+        print(
+            f"CV Val AUC: {np.mean(results['val_auc']):.4f} ± {np.std(results['val_auc']):.4f}"
+        )
+
+    def _log_regression_metrics(self, results: Dict[str, Any]) -> None:
+        """Log regression metrics to MLflow"""
+        # MAE Metrics
+        mlflow.log_metric("CV_Test_MAE_Mean", float(np.mean(results["test_mae"])))
+        mlflow.log_metric("CV_Test_MAE_Std", float(np.std(results["test_mae"])))
+        mlflow.log_metric("CV_Val_MAE_Mean", float(np.mean(results["val_mae"])))
+        mlflow.log_metric("CV_Val_MAE_Std", float(np.std(results["val_mae"])))
+
+        # MSE Metrics
+        mlflow.log_metric("CV_Test_MSE_Mean", float(np.mean(results["test_mse"])))
+        mlflow.log_metric("CV_Test_MSE_Std", float(np.std(results["test_mse"])))
+        mlflow.log_metric("CV_Val_MSE_Mean", float(np.mean(results["val_mse"])))
+        mlflow.log_metric("CV_Val_MSE_Std", float(np.std(results["val_mse"])))
+
+        # R² Metrics
+        mlflow.log_metric("CV_Test_R2_Mean", float(np.mean(results["test_r2"])))
+        mlflow.log_metric("CV_Test_R2_Std", float(np.std(results["test_r2"])))
+        mlflow.log_metric("CV_Val_R2_Mean", float(np.mean(results["val_r2"])))
+        mlflow.log_metric("CV_Val_R2_Std", float(np.std(results["val_r2"])))
+
+        print("\n################# Final Regression Results ###################")
+        print(
+            f"CV Test MAE: {np.mean(results['test_mae']):.4f} ± {np.std(results['test_mae']):.4f}"
+        )
+        print(
+            f"CV Test MSE: {np.mean(results['test_mse']):.4f} ± {np.std(results['test_mse']):.4f}"
+        )
+        print(
+            f"CV Test R²: {np.mean(results['test_r2']):.4f} ± {np.std(results['test_r2']):.4f}"
+        )
+        print(
+            f"CV Val MAE: {np.mean(results['val_mae']):.4f} ± {np.std(results['val_mae']):.4f}"
+        )
 
 
 # ==================== PUBLIC INTERFACE ====================
