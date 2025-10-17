@@ -596,14 +596,16 @@ class CLAM_MB_Regression(CLAM_SB_Regression):
         primary_raw = pattern_logits[0, 0]
         secondary_raw = pattern_logits[0, 1]
 
-        # Primary = max, Secondary = min (ensures primary >= secondary)
-        primary_constrained = torch.max(primary_raw, secondary_raw)
-        secondary_constrained = torch.min(primary_raw, secondary_raw)
+        ### The system is based on two main components: the Primary Score and the Secondary Score, each of which is a Gleason Grade with a value range from 3 to 5. A pathologist examines tissue samples from a prostate biopsy and assigns a grade from 1 to 5 to the two most common patterns of cancer cells observed. Higher grades indicate that the cancer cells look more abnormal or "undifferentiated," suggesting a more aggressive tumor.
+        # The Primary Score is the Gleason Grade assigned to the most common (predominant) pattern of cancer cells found in the tissue sample. And the Secondary Score is the Gleason Grade assigned to the second most common pattern of cancer cells found in the tissue sample.
+
+        ### Uncommnet below code if you assume the Primary Score is always larger than the secondary score
+        ### this is not true according to feedback from hospital expert.
+        # primary_raw = torch.max(primary_raw, secondary_raw)
+        # secondary_raw = torch.min(primary_raw, secondary_raw)
 
         # Replace with constrained values
-        pattern_logits = torch.stack(
-            [primary_constrained, secondary_constrained]
-        ).unsqueeze(0)
+        pattern_logits = torch.stack([primary_raw, secondary_raw]).unsqueeze(0)
 
         # Scale to Gleason score range
         pattern_values = (

@@ -4,6 +4,8 @@ import argparse
 from create_splits_seq import create_splits
 from dataset_modules.dataset_generic import (
     Generic_MIL_Dataset,
+    Generic_WSI_Classification_Dataset,
+    Generic_WSI_Regression_Dataset,
 )
 from utils.train_utils import MILTrainingConfig, TrainingResults, run_training
 from utils.utils import TaskType
@@ -29,7 +31,7 @@ def setup_dataset(config: MILTrainingConfig) -> Generic_MIL_Dataset:
             val_frac=0.15,
             test_frac=0.15,
         )
-        dataset = Generic_MIL_Dataset(
+        dataset = Generic_WSI_Classification_Dataset(
             csv_path="dataset_csv/tumor_vs_normal_dummy_clean.csv",
             data_dir=data_dir,
             shuffle=False,
@@ -49,7 +51,7 @@ def setup_dataset(config: MILTrainingConfig) -> Generic_MIL_Dataset:
             val_frac=0.15,
             test_frac=0.15,
         )
-        dataset = Generic_MIL_Dataset(
+        dataset = Generic_WSI_Classification_Dataset(
             csv_path="dataset_csv/tumor_subtyping_dummy_clean.csv",
             data_dir=data_dir,
             shuffle=False,
@@ -73,7 +75,7 @@ def setup_dataset(config: MILTrainingConfig) -> Generic_MIL_Dataset:
             val_frac=0.15,
             test_frac=0.15,
         )
-        dataset = Generic_MIL_Dataset(
+        dataset = Generic_WSI_Regression_Dataset(
             csv_path="dataset_csv/tumor_regression_dummy_clean.csv",
             data_dir=data_dir,
             shuffle=False,

@@ -1714,7 +1714,7 @@ class FoldTrainer:
 
     def train(self, datasets: Tuple[Any, Any, Any]) -> FoldResults:
         """Train for a single fold with MLflow tracking"""
-        with mlflow.start_run(run_name=f"Fold {self.fold_id}", nested=True):
+        with mlflow.start_run(run_name=f"Fold_{self.fold_id}", nested=True):
             # Log hyperparameters
             mlflow.log_params(
                 {

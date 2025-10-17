@@ -16,8 +16,6 @@ import h5py
 from utils.utils import generate_split, nth, TaskType
 
 
-
-
 def save_splits(split_datasets, column_keys, filename, boolean_style=False):
     splits = [
         split_datasets[i].slide_data["slide_id"] for i in range(len(split_datasets))
@@ -42,6 +40,7 @@ class Generic_WSI_Dataset(Dataset):
     def __init__(
         self,
         csv_path: str = "dataset_csv/ccrcc_clean.csv",
+        data_dir: Optional[str] = None,
         shuffle: bool = False,
         seed: int = 7,
         print_info: bool = True,
@@ -72,7 +71,7 @@ class Generic_WSI_Dataset(Dataset):
         self.print_info = print_info
         self.patient_strat = patient_strat
         self.train_ids, self.val_ids, self.test_ids = (None, None, None)
-        self.data_dir = None
+        self.data_dir = data_dir
 
         if not label_col:
             label_col = "label"
@@ -598,9 +597,8 @@ class Generic_WSI_Regression_Dataset(Generic_WSI_Dataset):
 class Generic_MIL_Dataset(Generic_WSI_Dataset):
     """Generic MIL Dataset that supports binary, multiclass, and regression tasks"""
 
-    def __init__(self, data_dir, **kwargs):
+    def __init__(self, **kwargs):
         super(Generic_MIL_Dataset, self).__init__(**kwargs)
-        self.data_dir = data_dir
         self.use_h5 = False
 
     def load_from_h5(self, toggle):
@@ -648,6 +646,7 @@ class Generic_Split(Generic_MIL_Dataset):
         elif self.task == TaskType.REGRESSION:
             # For regression, all samples belong to one "class"
             self.slide_cls_ids = [np.arange(len(self.slide_data))]
+            self.num_classes = -1
         else:
             raise Exception("Not supported task exception!")
 

@@ -12,8 +12,11 @@ from utils.utils import *
 import matplotlib.pyplot as plt
 from dataset_modules.dataset_generic import (
     Generic_MIL_Dataset,
+    Generic_WSI_Classification_Dataset,
+    Generic_WSI_Regression_Dataset,
 )
 from utils.eval_utils import *
+
 import mlflow
 from mlflow.models.signature import infer_signature
 from sklearn.metrics import classification_report, confusion_matrix
@@ -25,7 +28,7 @@ def setup_eval_dataset(config: EvalConfig) -> Generic_MIL_Dataset:
     data_dir: str = os.path.join(config.data_root_dir, config.data_set_name)
 
     if config.task == TaskType.BINARY:
-        dataset = Generic_MIL_Dataset(
+        dataset = Generic_WSI_Classification_Dataset(
             csv_path="dataset_csv/tumor_vs_normal_dummy_clean.csv",
             data_dir=data_dir,
             shuffle=False,
@@ -35,7 +38,7 @@ def setup_eval_dataset(config: EvalConfig) -> Generic_MIL_Dataset:
             ignore=[],
         )
     elif config.task == TaskType.MULTICLASS:
-        dataset = Generic_MIL_Dataset(
+        dataset = Generic_WSI_Classification_Dataset(
             csv_path="dataset_csv/tumor_subtyping_dummy_clean.csv",
             data_dir=data_dir,
             shuffle=False,
@@ -45,7 +48,7 @@ def setup_eval_dataset(config: EvalConfig) -> Generic_MIL_Dataset:
             ignore=[],
         )
     elif config.task == TaskType.REGRESSION:
-        dataset = Generic_MIL_Dataset(
+        dataset = Generic_WSI_Regression_Dataset(
             csv_path="dataset_csv/tumor_regression_dummy_clean.csv",
             data_dir=data_dir,
             shuffle=False,
@@ -156,174 +159,6 @@ def create_detailed_metrics_artifacts(
         print(f"Warning: Could not create detailed metrics for fold {fold}: {e}")
 
     return metrics_dict, artifacts
-
-
-def run_evaluation(config: EvalConfig) -> Dict[str, Any]:
-    """Main evaluation function. Starts the MLflow parent run for multi-fold evaluation."""
-    # MLFLOW INTEGRATION: Start the main run for multi-fold evaluation
-    experiment_name: str = f"Eval_{config.models_exp_code}"
-    mlflow.set_experiment(experiment_name)
-
-    run_name: str = f"Aggregate_{config.split}_from_{config.models_exp_code}"
-    with mlflow.start_run(run_name=run_name) as run:
-        # Setup device
-        device: torch.device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
-
-        # Setup dataset
-        dataset: Generic_MIL_Dataset = setup_eval_dataset(config)
-
-        # Log settings
-        settings: Dict[str, Any] = config.get_settings()
-
-        # MLFLOW INTEGRATION: Log all parameters for the aggregate run
-        mlflow.log_params(settings)
-
-        log_file: str = os.path.join(
-            config.save_dir, f"eval_experiment_{config.save_exp_code}.txt"
-        )
-        with open(log_file, "w") as f:
-            print(settings, file=f)
-
-        print("Evaluation Settings:")
-        for key, val in settings.items():
-            print(f"{key}:  {val}")
-
-        # Get checkpoint paths
-        ckpt_paths: List[str] = [
-            os.path.join(config.models_dir, f"s_{fold}_checkpoint.pt")
-            for fold in config.folds
-        ]
-
-        # Dataset split mapping
-        datasets_id: Dict[str, int] = {"train": 0, "val": 1, "test": 2, "all": -1}
-
-        # Run evaluation across folds
-        all_results: List[Any] = []
-        all_auc: List[float] = []
-        all_acc: List[float] = []
-        all_detailed_metrics: List[Optional[Dict[str, Any]]] = []
-
-        for ckpt_idx, fold in enumerate(config.folds):
-            # Get the appropriate dataset split
-            if datasets_id[config.split] < 0:
-                split_dataset: Generic_MIL_Dataset = dataset
-            else:
-                csv_path: str = f"{config.splits_dir}/splits_{fold}.csv"
-                datasets: List[Generic_MIL_Dataset] = dataset.return_splits(
-                    from_id=False, csv_path=csv_path
-                )
-                split_dataset = datasets[datasets_id[config.split]]
-
-            # Run evaluation
-            model, patient_results, test_error, auc, df, detailed_results = eval(
-                split_dataset, config, ckpt_paths[ckpt_idx], fold
-            )
-
-            all_results.append(patient_results)
-            all_auc.append(auc)
-            all_acc.append(1.0 - test_error)
-
-            # Extract and store detailed metrics for aggregation
-            if detailed_results and "detailed_metrics" in detailed_results:
-                all_detailed_metrics.append(detailed_results["detailed_metrics"])
-            else:
-                all_detailed_metrics.append(None)
-
-            # Save individual fold results
-            fold_results_path: str = os.path.join(config.save_dir, f"fold_{fold}.csv")
-            df.to_csv(fold_results_path, index=False)
-
-            # Log the individual fold CSV as an artifact in the *parent* run too
-            mlflow.log_artifact(fold_results_path, artifact_path="fold_results")
-
-        # Save summary
-        final_df: pd.DataFrame = pd.DataFrame(
-            {"folds": config.folds, "test_auc": all_auc, "test_acc": all_acc}
-        )
-
-        if len(config.folds) != config.k:
-            save_name: str = f"summary_partial_{config.folds[0]}_{config.folds[-1]}.csv"
-        else:
-            save_name: str = "summary.csv"
-
-        final_summary_path: str = os.path.join(config.save_dir, save_name)
-        final_df.to_csv(final_summary_path)
-
-        # MLFLOW INTEGRATION: Log final aggregate statistics and summary file
-        mlflow.log_artifact(final_summary_path)
-        mlflow.set_tag(
-            "Evaluating Info", f"CLAM model evaluating with {config.data_set_name} data"
-        )
-
-        # Log aggregate metrics
-        mlflow.log_metric(f"Aggregate_{config.split}_AUC_Mean", float(np.mean(all_auc)))
-        mlflow.log_metric(f"Aggregate_{config.split}_AUC_Std", float(np.std(all_auc)))
-        mlflow.log_metric(
-            f"Aggregate_{config.split}_Accuracy_Mean", float(np.mean(all_acc))
-        )
-        mlflow.log_metric(
-            f"Aggregate_{config.split}_Accuracy_Std", float(np.std(all_acc))
-        )
-
-        # Log detailed aggregate metrics if available
-        if all_detailed_metrics and config.detailed_metrics:
-            try:
-                # Calculate aggregate detailed metrics
-                all_precisions: List[float] = [
-                    m.get("macro_avg_precision", 0.0)
-                    for m in all_detailed_metrics
-                    if m is not None
-                ]
-                all_recalls: List[float] = [
-                    m.get("macro_avg_recall", 0.0)
-                    for m in all_detailed_metrics
-                    if m is not None
-                ]
-                all_f1_scores: List[float] = [
-                    m.get("macro_avg_f1_score", 0.0)
-                    for m in all_detailed_metrics
-                    if m is not None
-                ]
-
-                if all_precisions:
-                    mlflow.log_metric(
-                        f"Aggregate_{config.split}_Precision_Mean",
-                        float(np.mean(all_precisions)),
-                    )
-                    mlflow.log_metric(
-                        f"Aggregate_{config.split}_Precision_Std",
-                        float(np.std(all_precisions)),
-                    )
-                if all_recalls:
-                    mlflow.log_metric(
-                        f"Aggregate_{config.split}_Recall_Mean",
-                        float(np.mean(all_recalls)),
-                    )
-                    mlflow.log_metric(
-                        f"Aggregate_{config.split}_Recall_Std",
-                        float(np.std(all_recalls)),
-                    )
-                if all_f1_scores:
-                    mlflow.log_metric(
-                        f"Aggregate_{config.split}_F1_Mean",
-                        float(np.mean(all_f1_scores)),
-                    )
-                    mlflow.log_metric(
-                        f"Aggregate_{config.split}_F1_Std", float(np.std(all_f1_scores))
-                    )
-
-            except Exception as e:
-                print(f"Warning: Could not log aggregate detailed metrics: {e}")
-
-        return {
-            "all_results": all_results,
-            "all_auc": all_auc,
-            "all_acc": all_acc,
-            "all_detailed_metrics": all_detailed_metrics,
-            "final_df": final_df,
-        }
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -448,9 +283,11 @@ def main() -> Dict[str, Any]:
     config_dict["detailed_metrics"] = not args.no_detailed_metrics
 
     config: EvalConfig = EvalConfig(**config_dict)
+    # Setup dataset
+    dataset: Generic_MIL_Dataset = setup_eval_dataset(config)
 
     # Run evaluation
-    results: Dict[str, Any] = run_evaluation(config)
+    results: Dict[str, Any] = run_evaluation(config, dataset)
     print("Evaluation completed!")
 
     return results
