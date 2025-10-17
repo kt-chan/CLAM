@@ -68,7 +68,7 @@ class EvalConfig:
         self.registered_model_name = kwargs.get("registered_model_name")
         self.register_best_model = kwargs.get("register_best_model", True)
         self.detailed_metrics = kwargs.get("detailed_metrics", True)
-
+        self.seed = kwargs.get("seed", 1)
         # Setup derived attributes
         self._setup_derived_attributes()
 
@@ -1024,11 +1024,9 @@ class EvaluationRunner:
         Optional[Dict[str, Any]],  # detailed_results
     ]:
         """Evaluates the model and logs final results to MLflow with detailed metrics."""
-        experiment_name = f"Eval_{config.models_exp_code}"
-        mlflow.set_experiment(experiment_name)
         eval_run_name = f"Fold_{fold}_k{config.k}"
-
         with mlflow.start_run(run_name=eval_run_name, nested=True) as run:
+
             # Log checkpoint path
             mlflow.log_param("eval_ckpt_path", ckpt_path)
 
@@ -1089,6 +1087,19 @@ class EvaluationRunner:
         )
 
         return model, patient_results, test_error, primary_metric, df, detailed_results
+
+    @staticmethod
+    def _setup_mlflow_experiment(config: EvalConfig) -> mlflow.ActiveRun:
+        # ✅ Set seed exactly ONCE
+        print(f"Setting random seed: {config.seed}")
+        seed_torch(config.seed)
+
+        """Setup MLflow experiment and return the active run"""
+        experiment_name = f"Eval_{config.models_exp_code}"
+        mlflow.set_experiment(experiment_name)
+
+        run_name = f"CV_Seed{config.seed}_k{config.k}"
+        return mlflow.start_run(run_name=run_name)
 
     @staticmethod
     def _load_and_evaluate_model(
@@ -1458,28 +1469,30 @@ def run_evaluation(config: EvalConfig, dataset: Any) -> Dict[int, Dict[str, Any]
     """Run comprehensive evaluation across multiple folds."""
     all_results: Dict[int, Dict[str, Any]] = {}
 
-    for fold in config.folds:
-        print(f"\n{'='*50}")
-        print(f"Evaluating Fold {fold}")
-        print(f"{'='*50}")
+    with EvaluationRunner._setup_mlflow_experiment(config) as run:
 
-        try:
-            # Load dataset split for this fold
-            test_dataset = EvaluationRunner._load_test_split(config, fold, dataset)
-            if test_dataset is None:
+        for fold in config.folds:
+            print(f"\n{'='*50}")
+            print(f"Evaluating Fold {fold}")
+            print(f"{'='*50}")
+
+            try:
+                # Load dataset split for this fold
+                test_dataset = EvaluationRunner._load_test_split(config, fold, dataset)
+                if test_dataset is None:
+                    continue
+
+                # Find checkpoint for this fold
+                ckpt_path = EvaluationRunner._get_checkpoint_path(config, fold)
+                if ckpt_path is None:
+                    continue
+
+                # Run evaluation
+                results = EvaluationRunner.evaluate(test_dataset, config, ckpt_path, fold)
+                all_results[fold] = EvaluationRunner._format_fold_results(results)
+
+            except Exception as e:
+                print(f"Error evaluating fold {fold}: {e}")
                 continue
-
-            # Find checkpoint for this fold
-            ckpt_path = EvaluationRunner._get_checkpoint_path(config, fold)
-            if ckpt_path is None:
-                continue
-
-            # Run evaluation
-            results = EvaluationRunner.evaluate(test_dataset, config, ckpt_path, fold)
-            all_results[fold] = EvaluationRunner._format_fold_results(results)
-
-        except Exception as e:
-            print(f"Error evaluating fold {fold}: {e}")
-            continue
 
     return all_results
