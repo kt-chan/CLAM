@@ -321,7 +321,7 @@ class CLAM_SB_Regression(nn.Module):
         instance_loss_fn=nn.CrossEntropyLoss(),
         subtyping=False,
         embed_dim=1024,
-        min_score=3.0,
+        min_score=0.0,
         max_score=5.0,
     ):
         super().__init__()
@@ -449,28 +449,23 @@ class CLAM_SB_Regression(nn.Module):
         primary_raw = pattern_logits[0, 0]
         secondary_raw = pattern_logits[0, 1]
 
-        # Primary = max, Secondary = min (ensures primary >= secondary)
-        primary_constrained = torch.max(primary_raw, secondary_raw)
-        secondary_constrained = torch.min(primary_raw, secondary_raw)
-
         # Replace with constrained values
-        pattern_logits = torch.stack(
-            [primary_constrained, secondary_constrained]
-        ).unsqueeze(0)
+        pattern_logits = torch.stack([primary_raw, secondary_raw]).unsqueeze(0)
 
-        # Apply sigmoid to get values between 0-1, then scale to min_score-max_score range
-        pattern_values = (
-            torch.sigmoid(pattern_logits) * (self.max_score - self.min_score)
-            + self.min_score
-        )
+        # === UPDATED: Scale to full 0-5 range instead of 3-5 ===
+        pattern_values = torch.sigmoid(pattern_logits) * 5.0  # Scale to 0-5 range
 
-        # For final predictions - round to integers during inference
+        # === UPDATED: During inference, round and set scores <3 to 0 ===
         if not self.training:
-            pattern_predictions = torch.round(
-                pattern_values
-            )  # Gets integer scores 3,4,5
+            pattern_predictions = torch.round(pattern_values)
+            # Hard set any score below 3 to 0 (non-cancer)
+            pattern_predictions = torch.where(
+                pattern_predictions < 3,
+                torch.tensor(0.0, device=pattern_predictions.device),
+                pattern_predictions,
+            )
         else:
-            pattern_predictions = pattern_values  # Keep continuous for gradient flow
+            pattern_predictions = pattern_values  # Keep continuous for training
 
         if instance_eval:
             results_dict = {
@@ -497,7 +492,7 @@ class CLAM_MB_Regression(CLAM_SB_Regression):
         instance_loss_fn=nn.CrossEntropyLoss(),
         subtyping=False,
         embed_dim=1024,
-        min_score=3.0,
+        min_score=0.0,
         max_score=5.0,
     ):
         nn.Module.__init__(self)
@@ -592,32 +587,27 @@ class CLAM_MB_Regression(CLAM_SB_Regression):
         # Combine into final output
         pattern_logits = torch.cat([primary_logit, secondary_logit], dim=1)
 
-        # Apply max/min constraint - ALWAYS differentiable
+        # Apply max/min constraint
         primary_raw = pattern_logits[0, 0]
         secondary_raw = pattern_logits[0, 1]
-
-        ### The system is based on two main components: the Primary Score and the Secondary Score, each of which is a Gleason Grade with a value range from 3 to 5. A pathologist examines tissue samples from a prostate biopsy and assigns a grade from 1 to 5 to the two most common patterns of cancer cells observed. Higher grades indicate that the cancer cells look more abnormal or "undifferentiated," suggesting a more aggressive tumor.
-        # The Primary Score is the Gleason Grade assigned to the most common (predominant) pattern of cancer cells found in the tissue sample. And the Secondary Score is the Gleason Grade assigned to the second most common pattern of cancer cells found in the tissue sample.
-
-        ### Uncommnet below code if you assume the Primary Score is always larger than the secondary score
-        ### this is not true according to feedback from hospital expert.
-        # primary_raw = torch.max(primary_raw, secondary_raw)
-        # secondary_raw = torch.min(primary_raw, secondary_raw)
 
         # Replace with constrained values
         pattern_logits = torch.stack([primary_raw, secondary_raw]).unsqueeze(0)
 
-        # Scale to Gleason score range
-        pattern_values = (
-            torch.sigmoid(pattern_logits) * (self.max_score - self.min_score)
-            + self.min_score
-        )
+        # === UPDATED: Scale to full 0-5 range instead of 3-5 ===
+        pattern_values = torch.sigmoid(pattern_logits) * 5.0  # Scale to 0-5 range
 
-        # Round to integers during inference
+        # === UPDATED: During inference, round and set scores <3 to 0 ===
         if not self.training:
             pattern_predictions = torch.round(pattern_values)
+            # Hard set any score below 3 to 0 (non-cancer)
+            pattern_predictions = torch.where(
+                pattern_predictions < 3,
+                torch.tensor(0.0, device=pattern_predictions.device),
+                pattern_predictions,
+            )
         else:
-            pattern_predictions = pattern_values
+            pattern_predictions = pattern_values  # Keep continuous for training
 
         if instance_eval:
             results_dict = {
